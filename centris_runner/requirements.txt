@@ -1,0 +1,2 @@
+# No Python package dependencies are required.
+# The service uses only the Python standard library.
