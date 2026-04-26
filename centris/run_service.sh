@@ -27,4 +27,6 @@ if [ "${CENTRIS_SKIP_PULL:-0}" != "1" ]; then
   docker pull "$IMAGE"
 fi
 
+echo "[+] Starting Centris service."
+
 exec python3 app.py

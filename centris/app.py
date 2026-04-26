@@ -37,7 +37,7 @@ RUNTIME_DIR = DATA_DIR / "runtime"
 DATA_TAR = DATA_DIR / "Centris_dataset.tar"
 
 IMAGE = os.environ.get("CENTRIS_IMAGE", "seunghoonwoo/centris_code:latest")
-HOST = os.environ.get("CENTRIS_HOST", "127.0.0.1")
+HOST = os.environ.get("CENTRIS_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CENTRIS_PORT", "5679"))
 MAX_JOBS = int(os.environ.get("CENTRIS_MAX_JOBS", "1"))
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("CENTRIS_TIMEOUT_SECONDS", "3600"))
