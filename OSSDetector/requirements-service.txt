@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2
+python-multipart>=0.0.9
+pandas>=2
+openpyxl>=3
+# Optional, only needed for `python -m ossdetector_service.cli hash-source`:
+# py-tlsh>=4.7.2

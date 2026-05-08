@@ -65,7 +65,7 @@ This will:
 Default address:
 
 ```text
-http://127.0.0.1:5681
+http://0.0.0.0:8808
 ```
 
 ## API
@@ -73,19 +73,19 @@ http://127.0.0.1:5681
 ### Health
 
 ```bash
-curl http://127.0.0.1:5681/healthz
+curl http://0.0.0.0:8808/healthz
 ```
 
 ### Capabilities
 
 ```bash
-curl http://127.0.0.1:5681/capabilities
+curl http://0.0.0.0:8808/capabilities
 ```
 
 ### Submit a directory scan
 
 ```bash
-curl -s -X POST http://127.0.0.1:5681/scan \
+curl -s -X POST http://0.0.0.0:8808/scan \
   -H 'Content-Type: application/json' \
   -d '{
     "target_path": "/absolute/path/to/c_or_cpp_project",
@@ -99,7 +99,7 @@ curl -s -X POST http://127.0.0.1:5681/scan \
 ### Submit a single-file scan
 
 ```bash
-curl -s -X POST http://127.0.0.1:5681/scan \
+curl -s -X POST http://0.0.0.0:8808/scan \
   -H 'Content-Type: application/json' \
   -d '{
     "target_path": "/absolute/path/to/input.c",
@@ -113,25 +113,25 @@ curl -s -X POST http://127.0.0.1:5681/scan \
 ### Check status
 
 ```bash
-curl http://127.0.0.1:5681/jobs/JOB_ID
+curl http://0.0.0.0:8808/jobs/JOB_ID
 ```
 
 ### Get parsed result
 
 ```bash
-curl http://127.0.0.1:5681/jobs/JOB_ID/result
+curl http://0.0.0.0:8808/jobs/JOB_ID/result
 ```
 
 ### List artifacts
 
 ```bash
-curl http://127.0.0.1:5681/jobs/JOB_ID/artifacts
+curl http://0.0.0.0:8808/jobs/JOB_ID/artifacts
 ```
 
 ### Cancel
 
 ```bash
-curl -X POST http://127.0.0.1:5681/jobs/JOB_ID/cancel
+curl -X POST http://0.0.0.0:8808/jobs/JOB_ID/cancel
 ```
 
 ### Data
