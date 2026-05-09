@@ -22,7 +22,9 @@ if ! docker image inspect "$TIVER_DOCKER_IMAGE" >/dev/null 2>&1; then
   docker pull "$TIVER_DOCKER_IMAGE"
 fi
 
+: "${TIVER_SERVER_WORKERS:=1}"
 export TIVER_JOBS_DIR
 export TIVER_DOCKER_IMAGE
+export TIVER_SERVER_WORKERS
 
 python3 -m uvicorn app:app --host "$TIVER_HOST" --port "$TIVER_PORT"

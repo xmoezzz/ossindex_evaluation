@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import uuid
@@ -48,13 +49,14 @@ class JobSpec:
 
 
 def sanitize_repo_name(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9.-]+", "-", value.strip())
-    cleaned = cleaned.strip(".-")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    cleaned = cleaned.strip("._-")
     if not cleaned:
         raise ValueError("job_name must contain at least one alphanumeric character")
-    if "_" in cleaned:
-        raise ValueError("internal error: sanitized repository name still contains an underscore")
-    return cleaned[:80]
+    if len(cleaned) <= 120:
+        return cleaned
+    digest = hashlib.sha1(cleaned.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{cleaned[:100].rstrip('._-')}-{digest}"
 
 
 def require_absolute_dir(path: Path, label: str) -> Path:
@@ -98,10 +100,10 @@ def create_job_dirs(job_dir: Path) -> None:
         (job_dir / name).mkdir(parents=True, exist_ok=True)
 
 
-def _worker_name(jobs_dir: Path, docker_image: str) -> str:
-    raw = f"{jobs_dir.resolve()}::{docker_image}"
+def _worker_name(jobs_dir: Path, docker_image: str, worker_slot: int) -> str:
+    raw = f"{jobs_dir.resolve()}::{docker_image}::{worker_slot}"
     digest = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
-    return f"tiver-worker-{digest}"
+    return f"tiver-worker-{worker_slot}-{digest}"
 
 
 _WORKER_LOCK = threading.Lock()
@@ -118,11 +120,11 @@ def _cleanup_workers_at_exit() -> None:
         subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
-def ensure_worker_container(jobs_dir: Path, docker_image: str) -> str:
+def ensure_worker_container(jobs_dir: Path, docker_image: str, worker_slot: int = 0) -> str:
     global _WORKER_CLEANUP_REGISTERED
     ensure_tool("docker")
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    name = _worker_name(jobs_dir, docker_image)
+    name = _worker_name(jobs_dir, docker_image, worker_slot)
     with _WORKER_LOCK:
         if not _WORKER_CLEANUP_REGISTERED:
             atexit.register(_cleanup_workers_at_exit)
@@ -152,8 +154,8 @@ def ensure_worker_container(jobs_dir: Path, docker_image: str) -> str:
         return name
 
 
-def reset_worker_container(jobs_dir: Path, docker_image: str) -> None:
-    name = _worker_name(jobs_dir, docker_image)
+def reset_worker_container(jobs_dir: Path, docker_image: str, worker_slot: int = 0) -> None:
+    name = _worker_name(jobs_dir, docker_image, worker_slot)
     with _WORKER_LOCK:
         subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         _WORKER_STARTED.pop(name, None)
@@ -192,6 +194,40 @@ def _copy_source_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, symlinks=False)
 
 
+def _safe_extract_tar_archive(archive_path: Path, extract_dir: Path) -> None:
+    extract_root = extract_dir.resolve()
+    with tarfile.open(archive_path, "r:*") as tf:
+        members = tf.getmembers()
+        for member in members:
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"archive contains unsupported link entry: {member.name}")
+            if not (member.isfile() or member.isdir()):
+                raise RuntimeError(f"archive contains unsupported special entry: {member.name}")
+            target = (extract_dir / member.name).resolve()
+            if target != extract_root and not str(target).startswith(str(extract_root) + os.sep):
+                raise RuntimeError(f"unsafe archive entry: {member.name}")
+        tf.extractall(extract_dir, members=members)
+
+
+def _validate_batch_worker_input(worker_input: Path, manifest: list[dict[str, Any]]) -> None:
+    top_dirs = [p.name for p in sorted(worker_input.iterdir(), key=lambda p: p.name) if p.is_dir()]
+    if not top_dirs:
+        raise RuntimeError("batch archive contains no top-level source directories")
+    for dirname in top_dirs:
+        if sanitize_repo_name(dirname) != dirname:
+            raise RuntimeError(f"batch source directory name is not sanitized: {dirname}")
+    if manifest:
+        names = [entry.get("repo_name") for entry in manifest if isinstance(entry, dict)]
+        if not all(isinstance(name, str) and name for name in names):
+            raise RuntimeError("batch manifest contains invalid repo_name")
+        if len(set(names)) != len(names):
+            raise RuntimeError("batch manifest contains duplicate repo_name")
+        if set(names) != set(top_dirs):
+            missing = sorted(set(names).difference(top_dirs))
+            extra = sorted(set(top_dirs).difference(names))
+            raise RuntimeError(f"batch manifest/directories mismatch; missing={missing[:10]} extra={extra[:10]}")
+
+
 def prepare_worker_input(spec: JobSpec) -> Path:
     job_dir = spec.job_dir
     worker_input = job_dir / "worker_input"
@@ -200,17 +236,20 @@ def prepare_worker_input(spec: JobSpec) -> Path:
     worker_input.mkdir(parents=True, exist_ok=False)
 
     if spec.input_kind == "batch_archive":
-        batch_source = spec.target_path
-        if not batch_source.is_dir():
-            raise RuntimeError(f"batch source directory not found: {batch_source}")
-        top_dirs = [p for p in sorted(batch_source.iterdir(), key=lambda p: p.name) if p.is_dir()]
-        if not top_dirs:
-            raise RuntimeError("batch archive contains no top-level source directories")
-        for src in top_dirs:
-            safe_name = sanitize_repo_name(src.name)
-            if safe_name != src.name:
-                raise RuntimeError(f"batch source directory name is not sanitized: {src.name}")
-            _copy_source_tree(src, worker_input / safe_name)
+        archive_path = spec.target_path
+        if not archive_path.is_file():
+            raise RuntimeError(f"batch archive file not found: {archive_path}")
+        _safe_extract_tar_archive(archive_path, worker_input)
+        _validate_batch_worker_input(worker_input, spec.batch_manifest)
+        return worker_input
+
+    if spec.input_kind == "archive":
+        archive_path = spec.target_path
+        if not archive_path.is_file():
+            raise RuntimeError(f"source archive file not found: {archive_path}")
+        repo_dir = worker_input / spec.safe_repo_name
+        repo_dir.mkdir(parents=True, exist_ok=False)
+        _safe_extract_tar_archive(archive_path, repo_dir)
         return worker_input
 
     if not spec.target_path.is_dir():
@@ -226,8 +265,8 @@ JOB_ID="${TIVER_JOB_ID:?missing TIVER_JOB_ID}"
 cd /tiver/tiver_public
 
 rm -rf /tiver/clonehere res funcs output existPaths existPaths_v verPerHash
-mkdir -p /tiver/clonehere res funcs output existPaths existPaths_v verPerHash
-cp -a "/jobs/${JOB_ID}/worker_input/." /tiver/clonehere/
+mkdir -p res funcs output existPaths existPaths_v verPerHash
+ln -s "/jobs/${JOB_ID}/worker_input" /tiver/clonehere
 
 echo "[TIVER_STAGE] job=${TIVER_JOB_ID:-unknown} repo=${TIVER_REPO_NAME:-unknown} input_kind=${TIVER_INPUT_KIND:-unknown} start $(date -Is)"
 echo "[TIVER_STAGE] pwd=$(pwd)"
@@ -344,7 +383,7 @@ def collect_artifacts(job_dir: Path) -> list[dict[str, Any]]:
         for file_path in root.rglob("*"):
             if file_path.is_file():
                 artifacts.append(_artifact_record(job_dir, file_path))
-    for filename in ["stdout.log", "stderr.log", "command.json", "meta.json", "status.json", "result.json", "request.json", "batch_manifest.json"]:
+    for filename in ["stdout.log", "stderr.log", "command.json", "meta.json", "status.json", "result.json", "request.json", "batch_manifest.json", "input_archive.tar.gz", "input_batch.tar.gz"]:
         file_path = job_dir / filename
         if file_path.exists():
             artifacts.append(_artifact_record(job_dir, file_path))
@@ -430,7 +469,7 @@ def build_result(job_dir: Path, safe_repo_name: str) -> dict[str, Any]:
     return build_result_for_repo(job_dir, safe_repo_name) | {"artifacts": collect_artifacts(job_dir)}
 
 
-def run_tiver_job(spec: JobSpec) -> dict[str, Any]:
+def run_tiver_job(spec: JobSpec, worker_slot: int = 0) -> dict[str, Any]:
     ensure_tool("docker")
     create_job_dirs(spec.job_dir)
 
@@ -451,7 +490,7 @@ def run_tiver_job(spec: JobSpec) -> dict[str, Any]:
 
     try:
         prepare_worker_input(spec)
-        worker_name = ensure_worker_container(spec.jobs_dir, spec.docker_image)
+        worker_name = ensure_worker_container(spec.jobs_dir, spec.docker_image, worker_slot)
         cmd = worker_exec_command(spec, worker_name)
         write_json(spec.job_dir / "command.json", {"argv": cmd, "worker_container": worker_name})
         rc = run_command(
@@ -462,7 +501,7 @@ def run_tiver_job(spec: JobSpec) -> dict[str, Any]:
             timeout_seconds=spec.timeout_seconds,
         )
         if rc == 124:
-            reset_worker_container(spec.jobs_dir, spec.docker_image)
+            reset_worker_container(spec.jobs_dir, spec.docker_image, worker_slot)
             raise RuntimeError(f"TIVER worker command timed out after {spec.timeout_seconds} seconds")
         if rc != 0:
             raise RuntimeError(f"TIVER worker command failed with exit code {rc}")

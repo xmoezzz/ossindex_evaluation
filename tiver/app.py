@@ -4,7 +4,6 @@ import json
 import os
 import queue
 import shutil
-import tarfile
 import threading
 import time
 import uuid
@@ -31,12 +30,15 @@ from runner import (
 JOBS_DIR = Path(os.environ.get("TIVER_JOBS_DIR", "jobs")).expanduser().resolve()
 DOCKER_IMAGE = os.environ.get("TIVER_DOCKER_IMAGE", "geniuschoi/tiver:latest")
 MAX_QUEUE_SIZE = int(os.environ.get("TIVER_MAX_QUEUE_SIZE", "64"))
+SERVER_WORKERS = int(os.environ.get("TIVER_SERVER_WORKERS", "1"))
+if SERVER_WORKERS <= 0:
+    raise RuntimeError("TIVER_SERVER_WORKERS must be positive")
 
-app = FastAPI(title="TIVER source-level adaptive-version service", version="1.1.0")
+app = FastAPI(title="TIVER source-level adaptive-version service", version="1.2.0")
 job_queue: queue.Queue[str] = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 job_specs: dict[str, JobSpec] = {}
 job_lock = threading.Lock()
-worker_started = False
+workers_started = False
 
 
 class ScanRequest(BaseModel):
@@ -107,20 +109,26 @@ def _validate_timeout_seconds(value: int) -> int:
     return value
 
 
-def _safe_extract_tar_stream(fileobj: Any, extract_dir: Path) -> None:
-    extract_root = extract_dir.resolve()
-    with tarfile.open(fileobj=fileobj, mode="r:*") as tf:
-        members = tf.getmembers()
-        for member in members:
-            if member.issym() or member.islnk():
-                raise ValueError(f"archive contains unsupported link entry: {member.name}")
-            if not (member.isfile() or member.isdir()):
-                raise ValueError(f"archive contains unsupported special entry: {member.name}")
-            member_path = extract_dir / member.name
-            resolved = member_path.resolve()
-            if not str(resolved).startswith(str(extract_root) + os.sep) and resolved != extract_root:
-                raise ValueError(f"unsafe archive entry: {member.name}")
-        tf.extractall(extract_dir, members=members)
+def _save_upload_file(upload: UploadFile, destination: Path) -> int:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_suffix(destination.suffix + ".part")
+    size = 0
+    try:
+        with tmp.open("wb") as out:
+            while True:
+                chunk = upload.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                size += len(chunk)
+        tmp.replace(destination)
+        return size
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
 
 def _load_manifest_json(manifest_json: str | None) -> list[dict[str, Any]]:
@@ -133,6 +141,7 @@ def _load_manifest_json(manifest_json: str | None) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("manifest_json must be a JSON list")
     out: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for idx, item in enumerate(value, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"manifest item #{idx} is not an object")
@@ -142,12 +151,11 @@ def _load_manifest_json(manifest_json: str | None) -> list[dict[str, Any]]:
         safe = sanitize_repo_name(repo_name)
         if safe != repo_name:
             raise ValueError(f"manifest item #{idx} repo_name is not sanitized: {repo_name}")
+        if repo_name in seen:
+            raise ValueError(f"duplicate repo_name in manifest: {repo_name}")
+        seen.add(repo_name)
         out.append(dict(item))
     return out
-
-
-def _top_level_dirs(root: Path) -> list[str]:
-    return [p.name for p in sorted(root.iterdir(), key=lambda p: p.name) if p.is_dir()]
 
 
 def make_directory_spec(request: ScanRequest) -> JobSpec:
@@ -178,7 +186,7 @@ def make_uploaded_spec(*, job_name_value: str | None, timeout_seconds_value: int
         jobs_dir=JOBS_DIR,
         docker_image=DOCKER_IMAGE,
         timeout_seconds=_validate_timeout_seconds(timeout_seconds_value),
-        target_path=JOBS_DIR / job_id / "uploaded_source",
+        target_path=JOBS_DIR / job_id / "input_archive.tar.gz",
         input_kind="archive",
     )
 
@@ -194,7 +202,7 @@ def make_batch_spec(*, batch_name_value: str | None, timeout_seconds_value: int,
         jobs_dir=JOBS_DIR,
         docker_image=DOCKER_IMAGE,
         timeout_seconds=_validate_timeout_seconds(timeout_seconds_value),
-        target_path=JOBS_DIR / job_id / "uploaded_batch",
+        target_path=JOBS_DIR / job_id / "input_batch.tar.gz",
         input_kind="batch_archive",
         batch_manifest=manifest,
     )
@@ -221,7 +229,7 @@ def enqueue_spec(spec: JobSpec) -> ScanResponse:
     return ScanResponse(job_id=spec.job_id, status="queued", safe_repo_name=spec.safe_repo_name)
 
 
-def worker_loop() -> None:
+def worker_loop(worker_index: int) -> None:
     while True:
         job_id = job_queue.get()
         with job_lock:
@@ -231,7 +239,7 @@ def worker_loop() -> None:
             job_queue.task_done()
             continue
         try:
-            run_tiver_job(spec)
+            run_tiver_job(spec, worker_slot=worker_index)
         except Exception as exc:
             write_status(job_id, {"job_id": job_id, "status": "failed", "error": str(exc)})
         finally:
@@ -239,13 +247,14 @@ def worker_loop() -> None:
 
 
 @app.on_event("startup")
-def start_worker() -> None:
-    global worker_started
+def start_workers() -> None:
+    global workers_started
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    if not worker_started:
-        thread = threading.Thread(target=worker_loop, name="tiver-worker", daemon=True)
-        thread.start()
-        worker_started = True
+    if not workers_started:
+        for index in range(SERVER_WORKERS):
+            thread = threading.Thread(target=worker_loop, args=(index,), name=f"tiver-worker-{index}", daemon=True)
+            thread.start()
+        workers_started = True
 
 
 @app.get("/healthz")
@@ -255,6 +264,7 @@ def healthz() -> dict[str, Any]:
         "docker_image": DOCKER_IMAGE,
         "jobs_dir": str(JOBS_DIR),
         "queued_jobs": job_queue.qsize(),
+        "server_workers": SERVER_WORKERS,
     }
 
 
@@ -286,15 +296,9 @@ def scan_archive(
     try:
         spec = make_uploaded_spec(job_name_value=job_name, timeout_seconds_value=timeout_seconds)
         create_job_dirs(spec.job_dir)
-        upload_dir = spec.job_dir / "uploaded_source"
-        if upload_dir.exists():
-            shutil.rmtree(upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=False)
-        _safe_extract_tar_stream(file.file, upload_dir)
-        if not upload_dir.is_dir():
-            raise ValueError("uploaded source directory was not created")
+        size = _save_upload_file(file, spec.target_path)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"failed to unpack uploaded source archive: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"failed to save uploaded source archive: {exc}") from exc
     finally:
         try:
             file.file.close()
@@ -306,6 +310,8 @@ def scan_archive(
         {
             "input_kind": "archive",
             "filename": file.filename,
+            "archive_path": str(spec.target_path),
+            "archive_size_bytes": size,
             "job_name": job_name,
             "timeout_seconds": timeout_seconds,
         },
@@ -324,27 +330,9 @@ def scan_batch_archive(
         manifest = _load_manifest_json(manifest_json)
         spec = make_batch_spec(batch_name_value=batch_name, timeout_seconds_value=timeout_seconds, manifest=manifest)
         create_job_dirs(spec.job_dir)
-        upload_dir = spec.job_dir / "uploaded_batch"
-        if upload_dir.exists():
-            shutil.rmtree(upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=False)
-        _safe_extract_tar_stream(file.file, upload_dir)
-        top_dirs = _top_level_dirs(upload_dir)
-        if not top_dirs:
-            raise ValueError("batch archive contains no top-level source directories")
-        for dirname in top_dirs:
-            safe = sanitize_repo_name(dirname)
-            if safe != dirname:
-                raise ValueError(f"top-level directory is not sanitized: {dirname}")
-        if manifest:
-            manifest_names = {str(entry["repo_name"]) for entry in manifest}
-            missing = sorted(manifest_names.difference(top_dirs))
-            if missing:
-                raise ValueError(f"manifest references directories missing from archive: {missing[:10]}")
-        else:
-            manifest = [{"repo_name": name} for name in top_dirs]
+        size = _save_upload_file(file, spec.target_path)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"failed to unpack uploaded batch archive: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"failed to save uploaded batch archive: {exc}") from exc
     finally:
         try:
             file.file.close()
@@ -356,12 +344,15 @@ def scan_batch_archive(
         {
             "input_kind": "batch_archive",
             "filename": file.filename,
+            "archive_path": str(spec.target_path),
+            "archive_size_bytes": size,
             "batch_name": batch_name,
             "timeout_seconds": timeout_seconds,
             "repository_count": len(manifest),
         },
     )
-    write_json(spec.job_dir / "batch_manifest.json", manifest)
+    if manifest:
+        write_json(spec.job_dir / "batch_manifest.json", manifest)
     return enqueue_spec(spec)
 
 

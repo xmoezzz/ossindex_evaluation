@@ -22,13 +22,6 @@ tiver.py
 
 Important: TIVER is source-level C/C++ OSS adaptive-version identification. It is not a binary scanner.
 
-```bash
-python3 -m pip install -r requirements.txt
-chmod +x run_service.sh run_tiver_job.sh
-
-TIVER_JOBS_DIR=/data/tiver_service/jobs ./run_service.sh
-```
-
 ## Requirements
 
 - Linux host with Docker installed
