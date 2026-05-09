@@ -1,0 +1,27 @@
+# macOS requirements for LibvDiff feature generation and analysis.
+# This removes Linux/Intel MKL-only packages from the original requirements.txt
+# and uses versions with macOS wheels on recent Python versions.
+# Recommended Python: 3.9 or 3.10. Python 3.11 may work with these ranges.
+
+cptools==2.0.1
+docopt==0.6.2
+GitPython>=3.1.29,<4
+joblib>=1.2,<2
+lizard==1.17.10
+mpire>=2.6,<3
+networkx>=2.8,<3
+numpy>=1.23.5,<2
+pandas>=1.5.3,<2.2
+Pillow>=9.2,<11
+PyDriller>=2.2,<3
+Pygments>=2.13,<3
+python-dateutil>=2.8.2,<3
+pytz>=2022.4
+scikit-learn>=1.2,<1.5
+scipy>=1.10,<1.13
+threadpoolctl>=3.1,<4
+tqdm>=4.64,<5
+yarg==0.1.9
+
+# Needed by data_process/feat_encoding.py and Asteria model inference.
+torch>=2.0,<3

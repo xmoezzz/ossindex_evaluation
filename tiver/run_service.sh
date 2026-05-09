@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 : "${TIVER_HOST:=0.0.0.0}"
-: "${TIVER_PORT:=5681}"
+: "${TIVER_PORT:=8808}"
 : "${TIVER_JOBS_DIR:=$SCRIPT_DIR/jobs}"
 : "${TIVER_DOCKER_IMAGE:=geniuschoi/tiver:latest}"
 
