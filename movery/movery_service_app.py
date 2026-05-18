@@ -21,6 +21,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 OUTPUT_LOG_LIMIT = 20000
 
+
 @dataclass(frozen=True)
 class JobSpec:
     job_id: str
@@ -136,6 +137,7 @@ def worker_name(jobs_dir: Path, docker_image: str, slot: int) -> str:
     digest = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
     return f"movery-worker-{slot}-{digest}"
 
+
 _WORKER_CONTAINERS: set[str] = set()
 _WORKER_CONTAINER_LOCK = threading.Lock()
 
@@ -143,6 +145,7 @@ _WORKER_CONTAINER_LOCK = threading.Lock()
 def cleanup_worker_containers() -> None:
     for name in list(_WORKER_CONTAINERS):
         subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
 
 atexit.register(cleanup_worker_containers)
 
@@ -280,6 +283,7 @@ def build_result(spec: JobSpec) -> dict[str, Any]:
         "artifacts": artifact_list(job_dir),
     }
 
+
 JOBS_DIR = Path(env_str("MOVERY_JOBS_DIR", "jobs")).expanduser().resolve()
 DOCKER_IMAGE = env_str("MOVERY_DOCKER_IMAGE", "seunghoonwoo/movery-public:latest")
 SERVER_WORKERS = env_int("MOVERY_SERVER_WORKERS", 1)
@@ -371,7 +375,11 @@ def scan_archive(file: UploadFile = File(...), job_name: Optional[str] = Form(de
     )
     write_json(job_dir / "request.json", {"job_id": job_id, "job_name": spec.job_name, "safe_name": safe_name, "filename": file.filename, "timeout_seconds": timeout_seconds})
     update_status(job_dir, job_id=job_id, status="queued", error=None, result_available=False)
-    job_queue.put(spec)
+    try:
+        job_queue.put_nowait(spec)
+    except queue.Full:
+        update_status(job_dir, status="rejected", error="job queue is full", result_available=False)
+        raise HTTPException(status_code=503, detail="job queue is full")
     return {"job_id": job_id, "status": "queued", "job_name": spec.job_name, "safe_name": safe_name}
 
 
