@@ -39,6 +39,8 @@ job_queue: queue.Queue[str] = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 job_specs: dict[str, JobSpec] = {}
 job_lock = threading.Lock()
 workers_started = False
+worker_state_lock = threading.Lock()
+worker_current_jobs: dict[int, str | None] = {}
 
 
 class ScanRequest(BaseModel):
@@ -229,13 +231,32 @@ def enqueue_spec(spec: JobSpec) -> ScanResponse:
     return ScanResponse(job_id=spec.job_id, status="queued", safe_repo_name=spec.safe_repo_name)
 
 
+
+def capacity_snapshot() -> dict[str, Any]:
+    with worker_state_lock:
+        busy_workers = sum(1 for job_id in worker_current_jobs.values() if job_id is not None)
+    queued_jobs = job_queue.qsize()
+    idle_workers = max(0, SERVER_WORKERS - busy_workers)
+    return {
+        "server_workers": SERVER_WORKERS,
+        "busy_workers": busy_workers,
+        "idle_workers": idle_workers,
+        "queued_jobs": queued_jobs,
+        "queue_max_size": MAX_QUEUE_SIZE,
+        "can_accept": queued_jobs < MAX_QUEUE_SIZE,
+    }
+
 def worker_loop(worker_index: int) -> None:
     while True:
         job_id = job_queue.get()
+        with worker_state_lock:
+            worker_current_jobs[worker_index] = job_id
         with job_lock:
             spec = job_specs.get(job_id)
         if spec is None:
             write_status(job_id, {"job_id": job_id, "status": "failed", "error": "job specification was lost"})
+            with worker_state_lock:
+                worker_current_jobs[worker_index] = None
             job_queue.task_done()
             continue
         try:
@@ -243,6 +264,8 @@ def worker_loop(worker_index: int) -> None:
         except Exception as exc:
             write_status(job_id, {"job_id": job_id, "status": "failed", "error": str(exc)})
         finally:
+            with worker_state_lock:
+                worker_current_jobs[worker_index] = None
             job_queue.task_done()
 
 
@@ -252,6 +275,8 @@ def start_workers() -> None:
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     if not workers_started:
         for index in range(SERVER_WORKERS):
+            with worker_state_lock:
+                worker_current_jobs[index] = None
             thread = threading.Thread(target=worker_loop, args=(index,), name=f"tiver-worker-{index}", daemon=True)
             thread.start()
         workers_started = True
@@ -263,9 +288,13 @@ def healthz() -> dict[str, Any]:
         "ok": True,
         "docker_image": DOCKER_IMAGE,
         "jobs_dir": str(JOBS_DIR),
-        "queued_jobs": job_queue.qsize(),
-        "server_workers": SERVER_WORKERS,
+        **capacity_snapshot(),
     }
+
+
+@app.get("/capacity")
+def capacity() -> dict[str, Any]:
+    return capacity_snapshot()
 
 
 @app.post("/scan", response_model=ScanResponse)
