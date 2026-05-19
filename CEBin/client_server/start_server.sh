@@ -34,7 +34,7 @@ echo "[INFO] DEVICE=${DEVICE}"
 echo "[INFO] HOST=${HOST}"
 echo "[INFO] PORT=${PORT}"
 
-exec python "${SERVER_APP}" \
+exec python3.11 "${SERVER_APP}" \
   --cebin-root "${CEBIN_ROOT}" \
   --embedding-model "${EMBEDDING_MODEL}" \
   --comparison-model "${COMPARISON_MODEL}" \
