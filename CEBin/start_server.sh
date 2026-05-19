@@ -10,7 +10,7 @@ SERVER_APP="${CEBIN_ROOT}/client_server/server/app.py"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-9088}"
-DEVICE="${DEVICE:-cuda:0}"
+DEVICE="${DEVICE:-mps}"
 
 if [[ ! -f "${SERVER_APP}" ]]; then
   echo "[ERROR] server app not found: ${SERVER_APP}" >&2
