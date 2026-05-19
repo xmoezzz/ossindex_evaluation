@@ -3,7 +3,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 try:
     import binaryninja as bn
@@ -30,25 +30,9 @@ ADDRESS_TOKEN_TYPES = {
 }
 
 
-def add_cebin_path(cebin_root: str) -> None:
-    finetune_dir = os.path.join(os.path.abspath(cebin_root), "finetune")
-    if not os.path.isdir(finetune_dir):
-        raise FileNotFoundError(finetune_dir)
-    if finetune_dir not in sys.path:
-        sys.path.insert(0, finetune_dir)
-
-
-def load_tokenizer(cebin_root: str, tokenizer_path: str, max_length: int):
-    add_cebin_path(cebin_root)
-    from tokenizer import CebinTokenizer
-
-    tokenizer = CebinTokenizer.from_pretrained(tokenizer_path)
-    tokenizer.max_length = max_length
-    tokenizer.max_len = max_length
-    return tokenizer
-
-
-def iter_binary_paths(binary: Optional[str], binary_list: Optional[str]) -> Iterator[str]:
+def iter_binary_paths(inputs: List[str], binary: Optional[str], binary_list: Optional[str]) -> Iterator[str]:
+    for path in inputs:
+        yield os.path.abspath(path)
     if binary is not None:
         yield os.path.abspath(binary)
     if binary_list is not None:
@@ -94,9 +78,25 @@ def function_mlil(bv, func) -> Tuple[int, int, Dict[str, List[str]]]:
     return bb_cnt, instr_cnt, func_data
 
 
+def derive_package(binary_path: str, package: str) -> str:
+    if package != "auto":
+        return package
+    name = os.path.basename(binary_path)
+    return os.path.splitext(name)[0] or name
+
+
+def derive_output_path(output: Optional[str], binaries: List[str]) -> str:
+    if output:
+        return output
+    if len(binaries) == 1:
+        base = os.path.basename(binaries[0])
+        stem = os.path.splitext(base)[0] or base
+        return os.path.abspath(f"{stem}.functions.jsonl")
+    return os.path.abspath("functions.jsonl")
+
+
 def extract_binary(
     binary_path: str,
-    tokenizer,
     package: str,
     arch: str,
     compiler: str,
@@ -108,8 +108,10 @@ def extract_binary(
     if worker_threads > 0:
         bn.set_worker_thread_count(worker_threads)
     name = binary_name if binary_name is not None else os.path.basename(binary_path)
+    resolved_package = derive_package(binary_path, package)
     with bn.open_view(binary_path, update_analysis=False) as bv:
         bv.update_analysis_and_wait()
+        resolved_arch = bv.arch.name if arch == "auto" and bv.arch is not None else arch
         count = 0
         for func_sym in bv.get_symbols_of_type(bn.SymbolType.FunctionSymbol):
             if func_sym.name in SKIP_FUNCTIONS:
@@ -119,14 +121,13 @@ def extract_binary(
                 continue
             try:
                 bb_cnt, instr_cnt, func_data = function_mlil(bv, func)
-                encoded = tokenizer.encode_function(func_data)
-                if encoded is None:
+                if not func_data:
                     continue
                 yield {
                     "meta": {
                         "binary_path": binary_path,
-                        "package": package,
-                        "arch": arch,
+                        "package": resolved_package,
+                        "arch": resolved_arch,
                         "compiler": compiler,
                         "optimizer": optimizer,
                         "binary": name,
@@ -135,15 +136,7 @@ def extract_binary(
                         "bb_cnt": bb_cnt,
                         "instr_cnt": instr_cnt,
                     },
-                    "function": {
-                        "input_ids": encoded["input_ids"],
-                        "attention_mask": encoded["attention_mask"],
-                        "token_type_ids": encoded["token_type_ids"],
-                    },
-                    "cebin": {
-                        "pad_token_id": tokenizer.pad_token_id,
-                        "max_length": tokenizer.max_length,
-                    },
+                    "function": func_data,
                 }
                 count += 1
                 if max_functions is not None and count >= max_functions:
@@ -154,34 +147,44 @@ def extract_binary(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract CEBin tokenized functions with local BinaryNinja.")
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--binary", help="Single binary path.")
-    src.add_argument("--binary-list", help="Text file with one binary path per line.")
-    parser.add_argument("--cebin-root", required=True, help="Path to the CEBin repository root.")
-    parser.add_argument("--tokenizer", required=True, help="Path to cebin-tokenizer directory.")
-    parser.add_argument("--output", required=True, help="Output JSONL path.")
-    parser.add_argument("--package", default="unknown")
-    parser.add_argument("--arch", default="unknown")
+    parser = argparse.ArgumentParser(
+        description="Extract raw BinaryNinja MLIL tokens for remote CEBin inference.",
+        epilog=(
+            "Minimal usage: python client/extract_binaryninja.py /path/to/binary "
+            "-o output.functions.jsonl"
+        ),
+    )
+    parser.add_argument("inputs", nargs="*", help="Binary paths. Usually just pass one binary here.")
+    parser.add_argument("--binary", help="Single binary path. Kept for compatibility.")
+    parser.add_argument("--binary-list", help="Text file with one binary path per line.")
+    parser.add_argument("-o", "--output", help="Output JSONL path. Default: ./<binary>.functions.jsonl")
+    parser.add_argument("--package", default="auto", help="Metadata package name. Default: binary filename stem.")
+    parser.add_argument("--arch", default="auto", help="Metadata architecture. Default: BinaryNinja view architecture.")
     parser.add_argument("--compiler", default="unknown")
     parser.add_argument("--optimizer", default="unknown")
     parser.add_argument("--binary-name", help="Override binary name for --binary mode.")
-    parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--worker-threads", type=int, default=2)
     parser.add_argument("--max-functions", type=int)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.inputs and args.binary is None and args.binary_list is None:
+        parser.error("pass a binary path, --binary, or --binary-list")
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    tokenizer = load_tokenizer(args.cebin_root, args.tokenizer, args.max_length)
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+    binaries = list(dict.fromkeys(iter_binary_paths(args.inputs, args.binary, args.binary_list)))
+    if not binaries:
+        raise SystemExit("No input binaries.")
+    output = derive_output_path(args.output, binaries)
+
+    print(f"[INFO] OUTPUT={output}")
+    os.makedirs(os.path.dirname(os.path.abspath(output)) or ".", exist_ok=True)
     written = 0
-    with open(args.output, "w", encoding="utf-8") as out:
-        for binary_path in iter_binary_paths(args.binary, args.binary_list):
+    with open(output, "w", encoding="utf-8") as out:
+        for binary_path in binaries:
             for record in extract_binary(
                 binary_path=binary_path,
-                tokenizer=tokenizer,
                 package=args.package,
                 arch=args.arch,
                 compiler=args.compiler,
@@ -194,7 +197,7 @@ def main() -> None:
                 written += 1
     if written == 0:
         raise SystemExit("No functions were extracted.")
-    print(f"wrote {written} functions to {args.output}")
+    print(f"wrote {written} raw functions to {output}")
 
 
 if __name__ == "__main__":

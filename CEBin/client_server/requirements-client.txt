@@ -1,4 +1,3 @@
 requests
 numpy
 faiss-cpu
-transformers

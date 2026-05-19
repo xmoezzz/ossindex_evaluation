@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 import torch
 
 TokenFeatures = Dict[str, List[int]]
+RawFunction = Dict[str, List[str]]
+FunctionInput = Dict[str, Any]
 EncoderName = Literal["query", "key"]
 
 
@@ -16,6 +17,7 @@ class ModelPaths:
     cebin_root: str
     embedding_model: str
     comparison_model: Optional[str] = None
+    tokenizer: Optional[str] = None
 
 
 def _add_cebin_paths(cebin_root: str) -> None:
@@ -38,11 +40,40 @@ def _load_torch_model(path: str, device: torch.device) -> torch.nn.Module:
     return model
 
 
+def _resolve_tokenizer_path(paths: ModelPaths) -> str:
+    candidates: List[str] = []
+    if paths.tokenizer is not None:
+        candidates.append(paths.tokenizer)
+    root = os.path.abspath(paths.cebin_root)
+    candidates.extend([
+        os.path.join(root, "cebin-tokenizer"),
+        os.path.join(root, "data", "cebin-tokenizer"),
+    ])
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if os.path.isdir(candidate):
+            return candidate
+    raise FileNotFoundError("Unable to find cebin-tokenizer. Pass --tokenizer or put it under CEBin/cebin-tokenizer.")
+
+
 class CEBinInference:
-    def __init__(self, paths: ModelPaths, device: str, dtype: str = "auto") -> None:
+    def __init__(self, paths: ModelPaths, device: str, dtype: str = "auto", max_length: int = 1024) -> None:
         _add_cebin_paths(paths.cebin_root)
         self.device = self._resolve_device(device)
         self.dtype = self._resolve_dtype(dtype)
+        self.max_length = max_length
+
+        from cebin_tokenizer_compat import CebinTokenizer
+
+        tokenizer_path = _resolve_tokenizer_path(paths)
+        self.tokenizer = CebinTokenizer.from_pretrained(tokenizer_path)
+        self.tokenizer.max_length = max_length
+        self.tokenizer.max_len = max_length
+        if self.tokenizer.pad_token_id is None:
+            raise ValueError("CEBin tokenizer has no pad_token_id.")
+        self.pad_token_id = int(self.tokenizer.pad_token_id)
+        self.tokenizer_path = tokenizer_path
+
         self.embedding_model = _load_torch_model(paths.embedding_model, self.device)
         self.comparison_model = None
         if paths.comparison_model is not None:
@@ -57,10 +88,13 @@ class CEBinInference:
         if device == "auto":
             if torch.cuda.is_available():
                 return torch.device("cuda:0")
-            raise RuntimeError("CUDA is not available. Pass --device cpu only for debugging.")
+            raise RuntimeError("CUDA is not available. Pass --device cpu/mps only for debugging.")
         resolved = torch.device(device)
         if resolved.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available for the requested device.")
+        if resolved.type == "mps":
+            if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+                raise RuntimeError("MPS is not available for the requested device.")
         return resolved
 
     @staticmethod
@@ -78,6 +112,10 @@ class CEBinInference:
         raise ValueError(f"Unsupported dtype: {dtype}")
 
     @staticmethod
+    def _is_token_feature(function: FunctionInput) -> bool:
+        return all(key in function for key in ("input_ids", "attention_mask", "token_type_ids"))
+
+    @staticmethod
     def _validate_feature(feature: TokenFeatures) -> None:
         required = ("input_ids", "attention_mask", "token_type_ids")
         for key in required:
@@ -85,11 +123,54 @@ class CEBinInference:
                 raise ValueError(f"Missing token field: {key}")
             if not isinstance(feature[key], list):
                 raise ValueError(f"Token field must be a list: {key}")
+            if not all(isinstance(value, int) for value in feature[key]):
+                raise ValueError(f"Token field values must be integers: {key}")
         length = len(feature["input_ids"])
         if length == 0:
             raise ValueError("Empty input_ids are not allowed.")
         if len(feature["attention_mask"]) != length or len(feature["token_type_ids"]) != length:
             raise ValueError("input_ids, attention_mask, and token_type_ids must have the same length.")
+
+    @staticmethod
+    def _validate_raw_function(function: RawFunction) -> None:
+        if not isinstance(function, dict) or not function:
+            raise ValueError("Raw function must be a non-empty object.")
+        for key, value in function.items():
+            if not isinstance(key, str):
+                raise ValueError("Raw function instruction keys must be strings.")
+            if not isinstance(value, list) or not all(isinstance(token, str) for token in value):
+                raise ValueError("Raw function instruction values must be token string lists.")
+
+    def _tokenize_one(self, function: FunctionInput) -> Optional[TokenFeatures]:
+        if self._is_token_feature(function):
+            feature = {
+                "input_ids": list(function["input_ids"]),
+                "attention_mask": list(function["attention_mask"]),
+                "token_type_ids": list(function["token_type_ids"]),
+            }
+            self._validate_feature(feature)
+            return feature
+        raw = {str(key): list(value) for key, value in function.items()}
+        self._validate_raw_function(raw)
+        encoded = self.tokenizer.encode_function(raw)
+        if encoded is None:
+            return None
+        feature = {
+            "input_ids": list(encoded["input_ids"]),
+            "attention_mask": list(encoded["attention_mask"]),
+            "token_type_ids": list(encoded["token_type_ids"]),
+        }
+        self._validate_feature(feature)
+        return feature
+
+    def tokenize(self, functions: Sequence[FunctionInput]) -> List[TokenFeatures]:
+        features: List[TokenFeatures] = []
+        for function in functions:
+            feature = self._tokenize_one(function)
+            if feature is None:
+                raise ValueError("A function produced no tokens.")
+            features.append(feature)
+        return features
 
     @staticmethod
     def _truncate(feature: TokenFeatures, max_length: int) -> TokenFeatures:
@@ -130,25 +211,23 @@ class CEBinInference:
 
         batch = {"input_ids": [], "attention_mask": [], "token_type_ids": []}
         for feature in truncated:
-            length = len(feature["input_ids"])
+            length = min(len(feature["input_ids"]), longest)
             pad_len = longest - length
-            batch["input_ids"].append(feature["input_ids"] + [pad_token_id] * pad_len)
-            batch["attention_mask"].append(feature["attention_mask"] + [0] * pad_len)
-            batch["token_type_ids"].append(feature["token_type_ids"] + [pad_token_id] * pad_len)
+            batch["input_ids"].append(feature["input_ids"][:length] + [pad_token_id] * pad_len)
+            batch["attention_mask"].append(feature["attention_mask"][:length] + [0] * pad_len)
+            batch["token_type_ids"].append(feature["token_type_ids"][:length] + [pad_token_id] * pad_len)
         return {key: torch.tensor(value, dtype=torch.long, device=device) for key, value in batch.items()}
 
     @torch.no_grad()
     def embed(
         self,
-        features: Sequence[TokenFeatures],
+        functions: Sequence[FunctionInput],
         encoder: EncoderName,
-        pad_token_id: int,
         max_length: int = 1024,
         pad_to_multiple_of: int = 8,
     ) -> List[List[float]]:
-        for feature in features:
-            self._validate_feature(feature)
-        batch = self._pad_batch(features, pad_token_id, max_length, pad_to_multiple_of, self.device)
+        features = self.tokenize(functions)
+        batch = self._pad_batch(features, self.pad_token_id, max_length, pad_to_multiple_of, self.device)
         if encoder == "query":
             embeddings = self.embedding_model.encoder_q(**batch)
         elif encoder == "key":
@@ -160,8 +239,7 @@ class CEBinInference:
     @torch.no_grad()
     def compare(
         self,
-        pairs: Sequence[Dict[str, TokenFeatures]],
-        pad_token_id: int,
+        pairs: Sequence[Dict[str, FunctionInput]],
         max_length: int = 1024,
         pad_to_multiple_of: int = 8,
     ) -> List[float]:
@@ -172,10 +250,12 @@ class CEBinInference:
             left = pair.get("left")
             right = pair.get("right")
             if left is None or right is None:
-                raise ValueError("Each pair must contain left and right features.")
-            self._validate_feature(left)
-            self._validate_feature(right)
-            concatenated.append(self._concat_pair(left, right, max_length))
-        batch = self._pad_batch(concatenated, pad_token_id, max_length, pad_to_multiple_of, self.device)
+                raise ValueError("Each pair must contain left and right functions.")
+            left_feature = self._tokenize_one(left)
+            right_feature = self._tokenize_one(right)
+            if left_feature is None or right_feature is None:
+                raise ValueError("A pair function produced no tokens.")
+            concatenated.append(self._concat_pair(left_feature, right_feature, max_length))
+        batch = self._pad_batch(concatenated, self.pad_token_id, max_length, pad_to_multiple_of, self.device)
         logits = self.comparison_model(**batch)
         return logits.detach().float().cpu().view(-1).tolist()

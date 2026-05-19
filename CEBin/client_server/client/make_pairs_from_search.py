@@ -33,8 +33,8 @@ def load_functions(path: str) -> Dict[str, dict]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build comparison pairs from FAISS search results.")
     parser.add_argument("--search-results", required=True, help="JSONL from query_faiss.py.")
-    parser.add_argument("--query-functions", required=True, help="Tokenized query JSONL from extract_binaryninja.py.")
-    parser.add_argument("--reference-functions", required=True, help="Tokenized reference JSONL from extract_binaryninja.py.")
+    parser.add_argument("--query-functions", required=True, help="Raw query JSONL from extract_binaryninja.py.")
+    parser.add_argument("--reference-functions", required=True, help="Raw reference JSONL from extract_binaryninja.py.")
     parser.add_argument("--output", required=True, help="Output pair JSONL for compare_remote.py.")
     parser.add_argument("--top-k", type=int, default=20)
     return parser.parse_args()

@@ -2,7 +2,7 @@
 import argparse
 import json
 import os
-from typing import Iterable, Iterator, List, Optional
+from typing import Iterable, Iterator, List
 
 import numpy as np
 import requests
@@ -31,21 +31,10 @@ def chunks(iterator: Iterable[dict], batch_size: int) -> Iterator[List[dict]]:
         yield batch
 
 
-def infer_pad_token_id(batch: List[dict], explicit: Optional[int]) -> int:
-    if explicit is not None:
-        return explicit
-    for record in batch:
-        cebin = record.get("cebin") or {}
-        if "pad_token_id" in cebin:
-            return int(cebin["pad_token_id"])
-    raise ValueError("pad_token_id is missing. Pass --pad-token-id or use extract_binaryninja.py output.")
-
-
-def post_embed(server_url: str, batch: List[dict], encoder: str, pad_token_id: int, max_length: int) -> List[List[float]]:
+def post_embed(server_url: str, batch: List[dict], encoder: str, max_length: int) -> List[List[float]]:
     payload = {
         "functions": [record["function"] for record in batch],
         "encoder": encoder,
-        "pad_token_id": pad_token_id,
         "max_length": max_length,
         "pad_to_multiple_of": 8,
     }
@@ -60,15 +49,14 @@ def post_embed(server_url: str, batch: List[dict], encoder: str, pad_token_id: i
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Send locally tokenized functions to a CEBin inference server.")
-    parser.add_argument("--input", required=True, help="Tokenized function JSONL from extract_binaryninja.py.")
+    parser = argparse.ArgumentParser(description="Send raw BinaryNinja MLIL functions to a CEBin inference server.")
+    parser.add_argument("--input", required=True, help="Raw function JSONL from extract_binaryninja.py.")
     parser.add_argument("--server", required=True, help="Server URL, for example http://127.0.0.1:8000.")
     parser.add_argument("--output", required=True, help="Output .npz path for embeddings.")
     parser.add_argument("--meta-output", required=True, help="Output JSONL path for metadata.")
     parser.add_argument("--encoder", choices=["query", "key"], default="query")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=1024)
-    parser.add_argument("--pad-token-id", type=int)
     return parser.parse_args()
 
 
@@ -79,8 +67,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.meta_output)) or ".", exist_ok=True)
     with open(args.meta_output, "w", encoding="utf-8") as meta_fp:
         for batch in chunks(iter_records(args.input), args.batch_size):
-            pad_token_id = infer_pad_token_id(batch, args.pad_token_id)
-            batch_embeddings = post_embed(args.server, batch, args.encoder, pad_token_id, args.max_length)
+            batch_embeddings = post_embed(args.server, batch, args.encoder, args.max_length)
             embeddings.extend(batch_embeddings)
             for record in batch:
                 meta_fp.write(json.dumps(record.get("meta", {}), separators=(",", ":")) + "\n")

@@ -1,19 +1,19 @@
 # CEBin client/server split
 
-This split keeps BinaryNinja on the client machine and keeps the server limited to GPU inference.
+This split keeps BinaryNinja on the client machine and keeps the server responsible for CEBin tokenizer plus GPU inference. The client never needs CEBin model files and no longer needs the tokenizer.
 
 ## Layout
 
-- `client/extract_binaryninja.py`: local BinaryNinja MLIL extraction and CEBin tokenization.
-- `client/embed_remote.py`: sends tokenized functions to the GPU server and writes embeddings.
+- `client/extract_binaryninja.py`: local BinaryNinja MLIL extraction only. It writes raw function JSONL.
+- `client/embed_remote.py`: sends raw functions to the inference server and writes embeddings.
 - `client/build_faiss_index.py`: builds a local FAISS index from reference embeddings.
 - `client/query_faiss.py`: queries a local reference FAISS index with target embeddings.
 - `client/make_pairs_from_search.py`: converts FAISS candidates into pairwise comparison requests.
-- `client/compare_remote.py`: sends already-tokenized function pairs to the GPU server for pairwise scoring.
+- `client/compare_remote.py`: sends raw function pairs to the inference server for pairwise scoring.
 - `server/app.py`: FastAPI inference server.
-- `server/cebin_inference.py`: model loading, padding, embedding inference, and comparison inference.
+- `server/cebin_inference.py`: tokenizer loading, model loading, padding, embedding inference, and comparison inference.
 
-The server does not import BinaryNinja and does not process raw binaries.
+The server does not import BinaryNinja and does not process raw binaries. The client does not load CEBin tokenizer or models.
 
 ## Server
 
@@ -23,24 +23,51 @@ Install server dependencies on the GPU machine:
 cd /path/to/CEBin/client_server
 python3 -m venv .venv-server
 source .venv-server/bin/activate
+pip install --upgrade pip setuptools wheel
 pip install -r requirements-server.txt
 ```
 
-Run the server:
+Run the server with the wrapper:
+
+```bash
+cd /path/to/CEBin/client_server
+DEVICE=cuda:0 PORT=8000 ./start_server.sh
+```
+
+On a Mac smoke-test machine, use:
+
+```bash
+DEVICE=mps PORT=9088 ./start_server.sh
+```
+
+The wrapper expects:
+
+```text
+CEBin/models/CEBin-Embedding-Cisco.bin
+CEBin/models/CEBin-Comparison-Cisco.bin
+CEBin/cebin-tokenizer/
+```
+
+Manual server command:
 
 ```bash
 python server/app.py \
   --cebin-root /path/to/CEBin \
   --embedding-model /path/to/CEBin/models/CEBin-Embedding-Cisco.bin \
   --comparison-model /path/to/CEBin/models/CEBin-Comparison-Cisco.bin \
+  --tokenizer /path/to/CEBin/cebin-tokenizer \
   --device cuda:0 \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-For embedding-only deployment, omit `--comparison-model`.
+Health check:
 
-## Client: extract and tokenize with BinaryNinja
+```bash
+curl http://127.0.0.1:8000/v1/health
+```
+
+## Client: extract raw functions with BinaryNinja
 
 Run this on the licensed BinaryNinja machine:
 
@@ -48,24 +75,32 @@ Run this on the licensed BinaryNinja machine:
 cd /path/to/CEBin/client_server
 python3 -m venv .venv-client
 source .venv-client/bin/activate
+pip install --upgrade pip setuptools wheel
 pip install -r requirements-client.txt
 ```
 
 The BinaryNinja Python module must be available in this client environment.
 
+Minimal extraction command:
+
 ```bash
-python client/extract_binaryninja.py \
-  --cebin-root /path/to/CEBin \
-  --tokenizer /path/to/CEBin/cebin-tokenizer \
-  --binary /path/to/target.bin \
+python client/extract_binaryninja.py /path/to/target.bin \
+  -o target.functions.jsonl
+```
+
+Optional metadata:
+
+```bash
+python client/extract_binaryninja.py /path/to/target.bin \
   --package target-package \
-  --arch x64 \
-  --compiler unknown \
-  --optimizer unknown \
-  --output target.functions.jsonl
+  --compiler clang \
+  --optimizer O2 \
+  -o target.functions.jsonl
 ```
 
 ## Client: remote embedding inference
+
+For target/query functions:
 
 ```bash
 python client/embed_remote.py \
@@ -116,13 +151,7 @@ python client/make_pairs_from_search.py \
   --output target.pairs.jsonl
 ```
 
-`compare_remote.py` expects JSONL records in this shape:
-
-```json
-{"left":{"input_ids":[1],"attention_mask":[1],"token_type_ids":[1]},"right":{"input_ids":[1],"attention_mask":[1],"token_type_ids":[1]},"cebin":{"pad_token_id":1}}
-```
-
-Run:
+Run pairwise comparison:
 
 ```bash
 python client/compare_remote.py \
