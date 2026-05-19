@@ -159,3 +159,21 @@ python client/compare_remote.py \
   --server http://GPU_SERVER:8000 \
   --output pair_scores.jsonl
 ```
+## Server-side CVE scan
+
+For the current deployment target, BinaryNinja stays on the client and all CVE dataset/index/search/rerank work stays on the server. See `SERVER_SCAN.md`.
+
+Minimal client scan command:
+
+```bash
+python3.11 client/scan_remote.py --input /path/to/target_binary
+```
+
+Server-side data goes under:
+
+```text
+CEBin/data/cve/cve-dataset.tar.zst
+CEBin/data/cve/cve-function-list.csv
+CEBin/data/indexes/cve/
+```
+

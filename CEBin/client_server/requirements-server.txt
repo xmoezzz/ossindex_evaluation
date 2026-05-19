@@ -5,3 +5,5 @@ torch
 transformers>=4.41,<5
 accelerate
 numpy
+faiss-cpu
+zstandard
