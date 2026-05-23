@@ -12,11 +12,11 @@ if [ ! -d "$REPO_DIR/.git" ]; then
   git clone https://github.com/ShangzhiXu/Vulture.git "$REPO_DIR"
 fi
 
-python3 -m venv "$VENV_DIR"
+python3.11 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip
-python -m pip install -r "$SCRIPT_DIR/requirements-service.txt"
-python -m pip install -r "$REPO_DIR/requirements.txt"
+python3.11 -m pip install --upgrade pip
+python3.11 -m pip install -r "$SCRIPT_DIR/requirements-service.txt"
+python3.11 -m pip install -r "$REPO_DIR/requirements.txt"
 
 echo "Vulture repo: $REPO_DIR"
 echo "Virtualenv: $VENV_DIR"
