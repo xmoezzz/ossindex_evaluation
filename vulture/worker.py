@@ -23,6 +23,7 @@ WORK = ROOT / 'work'
 OUTPUT = ROOT / 'output'
 VENDOR = ROOT / 'vendor'
 VULTURE_REPO = VENDOR / 'Vulture'
+VULTURE_PYTHON = os.environ.get('VULTURE_PYTHON', sys.executable)
 
 
 class ServiceUnavailableError(RuntimeError):
@@ -449,7 +450,7 @@ class VultureService:
         with open(stdout_log, 'a', encoding='utf-8') as out, open(stderr_log, 'a', encoding='utf-8') as err:
             if req.get('run_tpl_reuse', True):
                 proc = subprocess.Popen(
-                    ['python3.11', 'Detector.py', str(staged)],
+                    [VULTURE_PYTHON, 'Detector.py', str(staged)],
                     cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
                     stdout=out,
                     stderr=err,
@@ -479,7 +480,7 @@ class VultureService:
                 func_result = VULTURE_REPO / 'TPLReuseDetector' / 'res' / f'result_{project_name}_func'
                 if func_result.exists():
                     proc2 = subprocess.Popen(
-                        ['python3.11', 'fp_eliminator.py', str(func_result)],
+                        [VULTURE_PYTHON, 'fp_eliminator.py', str(func_result)],
                         cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
                         stdout=out,
                         stderr=err,
@@ -503,7 +504,7 @@ class VultureService:
 
             if run_oneday:
                 proc3 = subprocess.Popen(
-                    ['python3.11', 'VersionBasedDetection.py', str(staged)],
+                    [VULTURE_PYTHON, 'VersionBasedDetection.py', str(staged)],
                     cwd=str(VULTURE_REPO / 'OneDayDetector'),
                     stdout=subprocess.PIPE,
                     stderr=err,
