@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import zipfile
 import time
@@ -22,6 +23,10 @@ WORK = ROOT / 'work'
 OUTPUT = ROOT / 'output'
 VENDOR = ROOT / 'vendor'
 VULTURE_REPO = VENDOR / 'Vulture'
+
+
+class ServiceUnavailableError(RuntimeError):
+    pass
 
 
 def iso_now() -> str:
@@ -57,18 +62,38 @@ class VultureService:
         self._queue: 'queue.Queue[str]' = queue.Queue()
         self._lock = threading.Lock()
         self._procs: Dict[str, subprocess.Popen] = {}
+        self._init_lock = threading.Lock()
+        self._init_event = threading.Event()
+        self._init_status = 'new'
+        self._init_error: Optional[str] = None
+        self._init_started_at: Optional[str] = None
+        self._init_finished_at: Optional[str] = None
+        self._init_result: Dict[str, Any] = {}
+        self._init_run_oneday = True
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
 
     def healthz(self) -> Dict[str, Any]:
         repo_ready = VULTURE_REPO.exists()
         layout = self._check_dataset_layout(run_oneday=True)
+        with self._init_lock:
+            init_status = self._init_status
+            init_error = self._init_error
+            init_started_at = self._init_started_at
+            init_finished_at = self._init_finished_at
+            init_result = dict(self._init_result)
+        ready = repo_ready and layout['ok'] and init_status == 'ready'
         return {
-            'status': 'ok',
+            'status': 'ready' if ready else init_status,
             'service': 'vulture',
             'repo_ready': repo_ready,
             'dataset_ready': layout['ok'],
             'dataset_missing': layout['missing'],
+            'init_status': init_status,
+            'init_error': init_error,
+            'init_started_at': init_started_at,
+            'init_finished_at': init_finished_at,
+            'init_result': init_result,
             'zip_inputs': {
                 'signature_zip': str(DATA / 'signature.zip'),
                 'aligned_patch_commits_zip': str(DATA / 'aligned_patch_commits.zip'),
@@ -90,7 +115,73 @@ class VultureService:
                 'aligned_patch_commits_zip': True,
                 'result_zip': False,
             },
+            'readiness_gate': {
+                'enabled': True,
+                'analyze_blocks_until_ready': True,
+                'initialization_scope': 'repo_layout_and_dataset',
+            },
         }
+
+    def _log(self, message: str) -> None:
+        print(f'[vulture-service] {message}', file=sys.stderr, flush=True)
+
+    def start_initialization(self, run_oneday: bool = True) -> None:
+        with self._init_lock:
+            if self._init_status in {'initializing', 'ready'}:
+                return
+            self._init_status = 'initializing'
+            self._init_error = None
+            self._init_started_at = iso_now()
+            self._init_finished_at = None
+            self._init_result = {}
+            self._init_run_oneday = run_oneday
+            self._init_event.clear()
+        thread = threading.Thread(target=self._initialize_dataset_thread, args=(run_oneday,), daemon=True)
+        thread.start()
+
+    def _initialize_dataset_thread(self, run_oneday: bool) -> None:
+        try:
+            self._log(f'initialization started run_oneday={run_oneday}')
+            result = self._prepare_repo_layout(run_oneday=run_oneday)
+            with self._init_lock:
+                self._init_status = 'ready'
+                self._init_error = None
+                self._init_finished_at = iso_now()
+                self._init_result = result
+            self._log('initialization finished status=ready')
+        except Exception as exc:
+            with self._init_lock:
+                self._init_status = 'failed'
+                self._init_error = str(exc)
+                self._init_finished_at = iso_now()
+                self._init_result = {}
+            self._log(f'initialization failed error={exc}')
+        finally:
+            self._init_event.set()
+
+    def ensure_ready(self, run_oneday: bool, timeout: Optional[float] = None) -> Dict[str, Any]:
+        with self._init_lock:
+            status = self._init_status
+            should_start = status == 'new'
+            if status == 'ready':
+                return dict(self._init_result)
+            if status == 'failed' and run_oneday and not self._init_run_oneday:
+                should_start = True
+
+        if should_start:
+            self.start_initialization(run_oneday=run_oneday)
+
+        completed = self._init_event.wait(timeout=timeout)
+        if not completed:
+            raise ServiceUnavailableError('dataset initialization is still running')
+
+        with self._init_lock:
+            status = self._init_status
+            error = self._init_error
+            result = dict(self._init_result)
+        if status != 'ready':
+            raise ServiceUnavailableError(f'dataset initialization failed: {error}')
+        return result
 
     def submit_scan(self, req: Dict[str, Any]) -> Dict[str, Any]:
         target = Path(req['target_path'])
@@ -103,6 +194,8 @@ class VultureService:
             raise ValueError('input_kind=directory but target_path is not a directory')
         if kind == 'file' and not target.is_file():
             raise ValueError('input_kind=file but target_path is not a file')
+
+        self.ensure_ready(run_oneday=bool(req.get('run_oneday_detection', True)), timeout=None)
 
         slug = req.get('job_name') or target.stem
         safe_slug = re.sub(r'[^A-Za-z0-9._-]+', '_', slug).strip('_') or 'job'
@@ -218,19 +311,40 @@ class VultureService:
                 missing.append(str(path))
         return {'ok': ok, 'missing': missing}
 
+    def _validate_zip(self, zip_path: Path) -> None:
+        if not zip_path.exists():
+            raise RuntimeError(f'required zip file not found: {zip_path}')
+        size = zip_path.stat().st_size
+        self._log(f'checking zip path={zip_path} size={size}')
+        if not zipfile.is_zipfile(zip_path):
+            raise RuntimeError(f'file is not a valid zip archive: {zip_path}')
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise RuntimeError(f'corrupt zip entry in {zip_path}: {bad}')
+        self._log(f'zip check passed path={zip_path}')
+
+    def _safe_extract_zip(self, zip_path: Path, tmp_dir: Path) -> None:
+        root = tmp_dir.resolve()
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            for info in zf.infolist():
+                target = (tmp_dir / info.filename).resolve()
+                if target != root and not str(target).startswith(str(root) + os.sep):
+                    raise RuntimeError(f'unsafe zip entry in {zip_path}: {info.filename}')
+            zf.extractall(tmp_dir)
+
     def _extract_zip_if_needed(self, zip_path: Path, dest_dir: Path, expected_paths: List[Path]) -> bool:
         if all(p.exists() for p in expected_paths):
+            self._log(f'dataset already extracted for zip={zip_path}')
             return False
-        if not zip_path.exists():
-            return False
+        self._validate_zip(zip_path)
         ensure_dir(dest_dir)
         tmp_dir = dest_dir / f'.extract_tmp_{zip_path.stem}'
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         ensure_dir(tmp_dir)
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(tmp_dir)
-        # flatten single top-level directory if present
+        self._log(f'extracting zip={zip_path} dest={dest_dir}')
+        self._safe_extract_zip(zip_path, tmp_dir)
         entries = [p for p in tmp_dir.iterdir() if p.name != '__MACOSX']
         source_root = entries[0] if len(entries) == 1 and entries[0].is_dir() else tmp_dir
         for child in list(source_root.iterdir()):
@@ -242,6 +356,7 @@ class VultureService:
                     target.unlink()
             shutil.move(str(child), str(target))
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        self._log(f'extraction finished zip={zip_path}')
         return True
 
     def _prepare_dataset(self, run_oneday: bool) -> Dict[str, Any]:
@@ -265,6 +380,7 @@ class VultureService:
     def _prepare_repo_layout(self, run_oneday: bool) -> Dict[str, Any]:
         if not VULTURE_REPO.exists():
             raise RuntimeError(f'Vulture repo not found: {VULTURE_REPO}. Run bootstrap_vulture.sh first.')
+        self._log(f'preparing dataset and repository layout run_oneday={run_oneday}')
         extracted = self._prepare_dataset(run_oneday)
         layout = self._check_dataset_layout(run_oneday=run_oneday)
         if not layout['ok']:
@@ -291,8 +407,10 @@ class VultureService:
             dst.parent.mkdir(parents=True, exist_ok=True)
             try:
                 dst.symlink_to(src, target_is_directory=True)
+                self._log(f'linked {dst} -> {src}')
             except FileExistsError:
                 pass
+        self._log('repository layout ready')
         return extracted
 
     def _stage_input(self, job: Job) -> Path:
@@ -309,7 +427,7 @@ class VultureService:
     def _run_job(self, job: Job) -> None:
         req = job.request
         run_oneday = bool(req.get('run_oneday_detection', True))
-        auto_extract = self._prepare_repo_layout(run_oneday=run_oneday)
+        auto_extract = self.ensure_ready(run_oneday=run_oneday, timeout=None)
         job.status = 'running'
         job.started_at = iso_now()
         staged = self._stage_input(job)
@@ -496,151 +614,3 @@ class VultureService:
             return int(s)
         except Exception:
             return None
-
-# ---------------------------------------------------------------------------
-# FastAPI adapter
-# ---------------------------------------------------------------------------
-# This adapter intentionally matches analyze_crates_with_vulture_direct.py:
-#   POST /api/v1/analyze
-#   GET  /api/v1/jobs/{job_id}
-#   GET  /api/v1/jobs/{job_id}/result
-# The client sends JSON with target_path/input_kind/job_name and does not upload files.
-
-from fastapi import Body, FastAPI, HTTPException
-
-app = FastAPI(title='VULTURE Service', version='1.0')
-_service = VultureService()
-
-
-@app.get('/health')
-def health() -> Dict[str, Any]:
-    return _service.healthz()
-
-
-@app.get('/healthz')
-def healthz() -> Dict[str, Any]:
-    return _service.healthz()
-
-
-@app.get('/api/v1/health')
-def api_health() -> Dict[str, Any]:
-    return _service.healthz()
-
-
-@app.get('/api/v1/capabilities')
-def api_capabilities() -> Dict[str, Any]:
-    return _service.capabilities()
-
-
-@app.post('/api/v1/analyze')
-def api_analyze(req: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    try:
-        return _service.submit_scan(req)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=f'missing required field: {exc.args[0]}')
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get('/api/v1/jobs')
-def api_list_jobs() -> Dict[str, Any]:
-    return {'jobs': _service.list_jobs()}
-
-
-@app.get('/api/v1/jobs/{job_id}')
-def api_get_job(job_id: str) -> Dict[str, Any]:
-    job = _service.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail='job not found')
-    return job
-
-
-@app.get('/api/v1/jobs/{job_id}/result')
-def api_get_result(job_id: str) -> Dict[str, Any]:
-    result = _service.get_result(job_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail='result not found')
-    return result
-
-
-@app.get('/api/v1/jobs/{job_id}/artifacts')
-def api_get_artifacts(job_id: str) -> Dict[str, Any]:
-    artifacts = _service.get_artifacts(job_id)
-    if artifacts is None:
-        raise HTTPException(status_code=404, detail='job not found')
-    return artifacts
-
-
-@app.post('/api/v1/jobs/{job_id}/cancel')
-def api_cancel_job(job_id: str) -> Dict[str, Any]:
-    return {'job_id': job_id, 'cancelled': _service.cancel_job(job_id)}
-
-
-# ---------------------------------------------------------------------------
-# Compatibility routes for the earlier service shape exposed by /openapi.json.
-# These keep the existing client-facing /api/v1/* API while also preserving
-# /scan and /jobs for manual use.
-# ---------------------------------------------------------------------------
-
-@app.get('/capabilities')
-def capabilities() -> Dict[str, Any]:
-    return _service.capabilities()
-
-
-@app.post('/scan')
-def scan(req: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    try:
-        return _service.submit_scan(req)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=f'missing required field: {exc.args[0]}')
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get('/jobs')
-def list_jobs() -> Dict[str, Any]:
-    return {'jobs': _service.list_jobs()}
-
-
-@app.get('/jobs/{job_id}')
-def get_job(job_id: str) -> Dict[str, Any]:
-    job = _service.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail='job not found')
-    return job
-
-
-@app.get('/jobs/{job_id}/result')
-def get_result(job_id: str) -> Dict[str, Any]:
-    result = _service.get_result(job_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail='result not found')
-    return result
-
-
-@app.get('/jobs/{job_id}/artifacts')
-def get_artifacts(job_id: str) -> Dict[str, Any]:
-    artifacts = _service.get_artifacts(job_id)
-    if artifacts is None:
-        raise HTTPException(status_code=404, detail='job not found')
-    return artifacts
-
-
-@app.post('/jobs/{job_id}/cancel')
-def cancel_job(job_id: str) -> Dict[str, Any]:
-    return {'job_id': job_id, 'cancelled': _service.cancel_job(job_id)}
-
-
-if __name__ == '__main__':
-    import argparse
-    import uvicorn
-
-    parser = argparse.ArgumentParser(description='Run the VULTURE FastAPI service.')
-    parser.add_argument('--host', default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=9089)
-    args = parser.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port)
