@@ -23,7 +23,7 @@ WORK = ROOT / 'work'
 OUTPUT = ROOT / 'output'
 VENDOR = ROOT / 'vendor'
 VULTURE_REPO = VENDOR / 'Vulture'
-VULTURE_PYTHON = os.environ.get('VULTURE_PYTHON', sys.executable)
+VULTURE_PYTHON = os.environ.get('VULTURE_PYTHON', 'python3.11')
 
 
 class ServiceUnavailableError(RuntimeError):
@@ -414,16 +414,42 @@ class VultureService:
         self._log('repository layout ready')
         return extracted
 
+    def _safe_vulture_repo_name(self, job: Job, target: Path) -> str:
+        raw = str(job.request.get('job_name') or target.stem or 'repo')
+        raw = raw.replace('_', '-')
+        safe = re.sub(r'[^A-Za-z0-9.-]+', '-', raw).strip('.-')
+        return safe or 'repo'
+
+    def _copy_tree(self, src: Path, dst: Path) -> None:
+        if dst.exists():
+            shutil.rmtree(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+        for path in sorted(src.rglob('*'), key=lambda p: str(p)):
+            if path.is_symlink():
+                continue
+            rel = path.relative_to(src)
+            target = dst / rel
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif path.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+
     def _stage_input(self, job: Job) -> Path:
         target = Path(job.request['target_path'])
         staged_root = Path(job.workdir) / 'input'
         ensure_dir(staged_root)
+        repo_name = self._safe_vulture_repo_name(job, target)
+        dest_dir = staged_root / repo_name
         if job.request.get('input_kind') == 'file':
-            dest_dir = staged_root / (job.request.get('job_name') or target.stem or 'input')
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
             ensure_dir(dest_dir)
             shutil.copy2(target, dest_dir / target.name)
-            return dest_dir
-        return target
+        else:
+            self._copy_tree(target, dest_dir)
+        self._log(f'staged input source={target} dest={dest_dir} repo_name={repo_name}')
+        return dest_dir
 
     def _run_job(self, job: Job) -> None:
         req = job.request
@@ -495,6 +521,8 @@ class VultureService:
                     except subprocess.TimeoutExpired:
                         os.killpg(os.getpgid(proc2.pid), signal.SIGTERM)
                         raise RuntimeError('TPL false-positive elimination timed out')
+                    if proc2.returncode != 0:
+                        raise RuntimeError(f'TPL false-positive elimination failed with exit code {proc2.returncode}')
                     modified_name = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
                     if modified_name.exists():
                         shutil.copy2(modified_name, raw_fp)
