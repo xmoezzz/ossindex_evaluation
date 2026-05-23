@@ -496,3 +496,94 @@ class VultureService:
             return int(s)
         except Exception:
             return None
+
+# ---------------------------------------------------------------------------
+# FastAPI adapter
+# ---------------------------------------------------------------------------
+# This adapter intentionally matches analyze_crates_with_vulture_direct.py:
+#   POST /api/v1/analyze
+#   GET  /api/v1/jobs/{job_id}
+#   GET  /api/v1/jobs/{job_id}/result
+# The client sends JSON with target_path/input_kind/job_name and does not upload files.
+
+from fastapi import Body, FastAPI, HTTPException
+
+app = FastAPI(title='VULTURE Service', version='1.0')
+_service = VultureService()
+
+
+@app.get('/health')
+def health() -> Dict[str, Any]:
+    return _service.healthz()
+
+
+@app.get('/healthz')
+def healthz() -> Dict[str, Any]:
+    return _service.healthz()
+
+
+@app.get('/api/v1/health')
+def api_health() -> Dict[str, Any]:
+    return _service.healthz()
+
+
+@app.get('/api/v1/capabilities')
+def api_capabilities() -> Dict[str, Any]:
+    return _service.capabilities()
+
+
+@app.post('/api/v1/analyze')
+def api_analyze(req: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    try:
+        return _service.submit_scan(req)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f'missing required field: {exc.args[0]}')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get('/api/v1/jobs')
+def api_list_jobs() -> Dict[str, Any]:
+    return {'jobs': _service.list_jobs()}
+
+
+@app.get('/api/v1/jobs/{job_id}')
+def api_get_job(job_id: str) -> Dict[str, Any]:
+    job = _service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail='job not found')
+    return job
+
+
+@app.get('/api/v1/jobs/{job_id}/result')
+def api_get_result(job_id: str) -> Dict[str, Any]:
+    result = _service.get_result(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail='result not found')
+    return result
+
+
+@app.get('/api/v1/jobs/{job_id}/artifacts')
+def api_get_artifacts(job_id: str) -> Dict[str, Any]:
+    artifacts = _service.get_artifacts(job_id)
+    if artifacts is None:
+        raise HTTPException(status_code=404, detail='job not found')
+    return artifacts
+
+
+@app.post('/api/v1/jobs/{job_id}/cancel')
+def api_cancel_job(job_id: str) -> Dict[str, Any]:
+    return {'job_id': job_id, 'cancelled': _service.cancel_job(job_id)}
+
+
+if __name__ == '__main__':
+    import argparse
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description='Run the VULTURE FastAPI service.')
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=9089)
+    args = parser.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port)
