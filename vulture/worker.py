@@ -504,30 +504,56 @@ class VultureService:
                     tpl_results['parsed_lines'] = []
 
                 func_result = VULTURE_REPO / 'TPLReuseDetector' / 'res' / f'result_{project_name}_func'
+                modified_name = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
                 if func_result.exists():
-                    proc2 = subprocess.Popen(
-                        [VULTURE_PYTHON, 'fp_eliminator.py', str(func_result)],
-                        cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
-                        stdout=out,
-                        stderr=err,
-                        env=env,
-                        preexec_fn=os.setsid,
-                    )
-                    with self._lock:
-                        self._procs[job.job_id] = proc2
-                        job.pid = proc2.pid
+                    func_text = func_result.read_text(encoding='utf-8', errors='replace').strip()
                     try:
-                        proc2.wait(timeout=timeout)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(os.getpgid(proc2.pid), signal.SIGTERM)
-                        raise RuntimeError('TPL false-positive elimination timed out')
-                    if proc2.returncode != 0:
-                        raise RuntimeError(f'TPL false-positive elimination failed with exit code {proc2.returncode}')
-                    modified_name = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
-                    if modified_name.exists():
+                        func_json = json.loads(func_text) if func_text else {}
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(f'invalid TPL function result JSON: {func_result}: {exc}') from exc
+
+                    if not isinstance(func_json, dict):
+                        raise RuntimeError(f'invalid TPL function result shape: {func_result}')
+
+                    if not func_json:
+                        modified_name.write_text('', encoding='utf-8')
                         shutil.copy2(modified_name, raw_fp)
-                        tpl_results['fp_eliminated_lines'] = modified_name.read_text(encoding='utf-8', errors='replace').splitlines()
+                        tpl_results['fp_eliminated_lines'] = []
+                    elif project_name not in func_json:
+                        keys = sorted(str(k) for k in func_json.keys())[:20]
+                        raise RuntimeError(
+                            f'TPL function result repo mismatch: expected {project_name}, got keys={keys}'
+                        )
+                    else:
+                        proc2 = subprocess.Popen(
+                            [VULTURE_PYTHON, 'fp_eliminator.py', str(func_result)],
+                            cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
+                            stdout=out,
+                            stderr=err,
+                            env=env,
+                            preexec_fn=os.setsid,
+                        )
+                        with self._lock:
+                            self._procs[job.job_id] = proc2
+                            job.pid = proc2.pid
+                        try:
+                            proc2.wait(timeout=timeout)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(os.getpgid(proc2.pid), signal.SIGTERM)
+                            raise RuntimeError('TPL false-positive elimination timed out')
+                        if proc2.returncode != 0:
+                            raise RuntimeError(f'TPL false-positive elimination failed with exit code {proc2.returncode}')
+                        if modified_name.exists():
+                            shutil.copy2(modified_name, raw_fp)
+                            tpl_results['fp_eliminated_lines'] = modified_name.read_text(
+                                encoding='utf-8',
+                                errors='replace',
+                            ).splitlines()
+                        else:
+                            raise RuntimeError(f'TPL false-positive elimination did not create expected output: {modified_name}')
                 else:
+                    modified_name.write_text('', encoding='utf-8')
+                    shutil.copy2(modified_name, raw_fp)
                     tpl_results['fp_eliminated_lines'] = []
 
             if run_oneday:
