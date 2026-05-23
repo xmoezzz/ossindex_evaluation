@@ -449,7 +449,7 @@ class VultureService:
         with open(stdout_log, 'a', encoding='utf-8') as out, open(stderr_log, 'a', encoding='utf-8') as err:
             if req.get('run_tpl_reuse', True):
                 proc = subprocess.Popen(
-                    ['python3', 'Detector.py', str(staged)],
+                    ['python3.11', 'Detector.py', str(staged)],
                     cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
                     stdout=out,
                     stderr=err,
@@ -479,7 +479,7 @@ class VultureService:
                 func_result = VULTURE_REPO / 'TPLReuseDetector' / 'res' / f'result_{project_name}_func'
                 if func_result.exists():
                     proc2 = subprocess.Popen(
-                        ['python3', 'fp_eliminator.py', str(func_result)],
+                        ['python3.11', 'fp_eliminator.py', str(func_result)],
                         cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
                         stdout=out,
                         stderr=err,
@@ -503,7 +503,7 @@ class VultureService:
 
             if run_oneday:
                 proc3 = subprocess.Popen(
-                    ['python3', 'VersionBasedDetection.py', str(staged)],
+                    ['python3.11', 'VersionBasedDetection.py', str(staged)],
                     cwd=str(VULTURE_REPO / 'OneDayDetector'),
                     stdout=subprocess.PIPE,
                     stderr=err,
