@@ -578,6 +578,63 @@ def api_cancel_job(job_id: str) -> Dict[str, Any]:
     return {'job_id': job_id, 'cancelled': _service.cancel_job(job_id)}
 
 
+# ---------------------------------------------------------------------------
+# Compatibility routes for the earlier service shape exposed by /openapi.json.
+# These keep the existing client-facing /api/v1/* API while also preserving
+# /scan and /jobs for manual use.
+# ---------------------------------------------------------------------------
+
+@app.get('/capabilities')
+def capabilities() -> Dict[str, Any]:
+    return _service.capabilities()
+
+
+@app.post('/scan')
+def scan(req: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    try:
+        return _service.submit_scan(req)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f'missing required field: {exc.args[0]}')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get('/jobs')
+def list_jobs() -> Dict[str, Any]:
+    return {'jobs': _service.list_jobs()}
+
+
+@app.get('/jobs/{job_id}')
+def get_job(job_id: str) -> Dict[str, Any]:
+    job = _service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail='job not found')
+    return job
+
+
+@app.get('/jobs/{job_id}/result')
+def get_result(job_id: str) -> Dict[str, Any]:
+    result = _service.get_result(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail='result not found')
+    return result
+
+
+@app.get('/jobs/{job_id}/artifacts')
+def get_artifacts(job_id: str) -> Dict[str, Any]:
+    artifacts = _service.get_artifacts(job_id)
+    if artifacts is None:
+        raise HTTPException(status_code=404, detail='job not found')
+    return artifacts
+
+
+@app.post('/jobs/{job_id}/cancel')
+def cancel_job(job_id: str) -> Dict[str, Any]:
+    return {'job_id': job_id, 'cancelled': _service.cancel_job(job_id)}
+
+
 if __name__ == '__main__':
     import argparse
     import uvicorn
