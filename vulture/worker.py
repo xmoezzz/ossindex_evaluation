@@ -10,13 +10,12 @@ import subprocess
 import sys
 import threading
 import zipfile
-import tarfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -24,7 +23,7 @@ WORK = ROOT / 'work'
 OUTPUT = ROOT / 'output'
 VENDOR = ROOT / 'vendor'
 VULTURE_REPO = VENDOR / 'Vulture'
-VULTURE_PYTHON = os.environ.get('VULTURE_PYTHON', 'python3.11')
+VULTURE_PYTHON = os.environ.get('VULTURE_PYTHON', sys.executable)
 
 
 class ServiceUnavailableError(RuntimeError):
@@ -106,8 +105,8 @@ class VultureService:
     def capabilities(self) -> Dict[str, Any]:
         return {
             'service': 'vulture',
-            'input_modes': ['upload', 'path'],
-            'supported_input_kinds': ['archive', 'directory', 'file'],
+            'input_modes': ['path'],
+            'supported_input_kinds': ['directory', 'file'],
             'languages': ['c', 'cpp'],
             'stages': ['tpl_reuse', 'one_day_detection'],
             'outputs': ['tpl_reuse_raw', 'one_day_stdout', 'one_day_summary_json'],
@@ -185,79 +184,6 @@ class VultureService:
             raise ServiceUnavailableError(f'dataset initialization failed: {error}')
         return result
 
-    def _create_job(self, req: Dict[str, Any], slug_source: str) -> Job:
-        slug = req.get('job_name') or slug_source
-        safe_slug = re.sub(r'[^A-Za-z0-9._-]+', '_', str(slug)).strip('_') or 'job'
-        job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_slug}_{uuid.uuid4().hex[:8]}"
-        outdir = OUTPUT / job_id
-        workdir = WORK / job_id
-        ensure_dir(outdir)
-        ensure_dir(workdir)
-        job = Job(job_id=job_id, request=req, workdir=str(workdir), outdir=str(outdir))
-        with self._lock:
-            self._jobs[job_id] = job
-        return job
-
-    def reserve_upload_scan(self, req: Dict[str, Any], original_filename: str) -> Dict[str, Any]:
-        kind = req.get('input_kind', 'archive')
-        if kind not in {'archive', 'file'}:
-            raise ValueError('input_kind must be archive or file for upload scans')
-
-        self.ensure_ready(run_oneday=bool(req.get('run_oneday_detection', True)), timeout=None)
-
-        upload_name = self._safe_upload_filename(original_filename)
-        request = dict(req)
-        request['input_mode'] = 'upload'
-        request['upload_filename'] = upload_name
-        request.pop('target_path', None)
-        job = self._create_job(request, Path(upload_name).stem or 'upload')
-        job.status = 'receiving'
-        upload_dir = Path(job.workdir) / 'upload'
-        ensure_dir(upload_dir)
-        upload_path = upload_dir / upload_name
-        job.request['uploaded_path'] = str(upload_path)
-        self._write_result(job, {
-            'job_id': job.job_id,
-            'status': 'receiving',
-            'service': 'vulture',
-            'input_mode': 'upload',
-            'upload_filename': upload_name,
-        })
-        return {'job_id': job.job_id, 'status': job.status, 'upload_path': str(upload_path)}
-
-    def finish_upload_scan(self, job_id: str, size: int) -> Dict[str, Any]:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                raise ValueError('job not found')
-            if job.status != 'receiving':
-                raise ValueError(f'job is not receiving upload: {job.status}')
-            upload_path = Path(job.request['uploaded_path'])
-            if not upload_path.is_file():
-                raise ValueError(f'uploaded file does not exist: {upload_path}')
-            job.request['uploaded_size'] = size
-            job.status = 'queued'
-            self._write_result(job, {
-                'job_id': job.job_id,
-                'status': 'queued',
-                'service': 'vulture',
-                'input_mode': 'upload',
-                'upload_filename': job.request.get('upload_filename'),
-                'uploaded_size': size,
-            })
-        self._queue.put(job_id)
-        return {'job_id': job_id, 'status': 'queued'}
-
-    def fail_upload_scan(self, job_id: str, error: str) -> None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return
-            job.status = 'failed'
-            job.error = error
-            job.finished_at = iso_now()
-            self._write_result(job, {'job_id': job.job_id, 'status': 'failed', 'error': error})
-
     def submit_scan(self, req: Dict[str, Any]) -> Dict[str, Any]:
         target = Path(req['target_path'])
         if not target.is_absolute():
@@ -272,11 +198,19 @@ class VultureService:
 
         self.ensure_ready(run_oneday=bool(req.get('run_oneday_detection', True)), timeout=None)
 
-        request = dict(req)
-        request['input_mode'] = 'path'
-        job = self._create_job(request, target.stem)
-        self._queue.put(job.job_id)
-        return {'job_id': job.job_id, 'status': job.status}
+        slug = req.get('job_name') or target.stem
+        safe_slug = re.sub(r'[^A-Za-z0-9._-]+', '_', slug).strip('_') or 'job'
+        job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_slug}_{uuid.uuid4().hex[:8]}"
+        outdir = OUTPUT / job_id
+        workdir = WORK / job_id
+        ensure_dir(outdir)
+        ensure_dir(workdir)
+
+        job = Job(job_id=job_id, request=req, workdir=str(workdir), outdir=str(outdir))
+        with self._lock:
+            self._jobs[job_id] = job
+        self._queue.put(job_id)
+        return {'job_id': job_id, 'status': job.status}
 
     def list_jobs(self) -> List[Dict[str, Any]]:
         with self._lock:
@@ -480,92 +414,16 @@ class VultureService:
         self._log('repository layout ready')
         return extracted
 
-    def _safe_vulture_repo_name(self, job: Job, target: Path) -> str:
-        raw = str(job.request.get('job_name') or target.stem or 'repo')
-        raw = raw.replace('_', '-')
-        safe = re.sub(r'[^A-Za-z0-9.-]+', '-', raw).strip('.-')
-        return safe or 'repo'
-
-    def _safe_upload_filename(self, value: str) -> str:
-        raw = Path(value or 'upload.bin').name
-        safe = re.sub(r'[^A-Za-z0-9._-]+', '_', raw).strip('._')
-        return safe or 'upload.bin'
-
-    def _safe_extract_tar_upload(self, archive_path: Path, dest_dir: Path) -> None:
-        root = dest_dir.resolve()
-        with tarfile.open(archive_path, 'r:*') as tf:
-            for member in tf.getmembers():
-                target = (dest_dir / member.name).resolve()
-                if target != root and not str(target).startswith(str(root) + os.sep):
-                    raise RuntimeError(f'unsafe tar entry in upload archive: {member.name}')
-            tf.extractall(dest_dir)
-
-    def _safe_extract_upload_archive(self, archive_path: Path, dest_dir: Path) -> str:
-        if dest_dir.exists():
-            shutil.rmtree(dest_dir)
-        ensure_dir(dest_dir)
-        if zipfile.is_zipfile(archive_path):
-            self._safe_extract_zip(archive_path, dest_dir)
-            return 'zip'
-        if tarfile.is_tarfile(archive_path):
-            self._safe_extract_tar_upload(archive_path, dest_dir)
-            return 'tar'
-        raise ValueError(f'unsupported upload archive type: {archive_path.name}')
-
-    def _copy_tree(self, src: Path, dst: Path) -> None:
-        if dst.exists():
-            shutil.rmtree(dst)
-        dst.mkdir(parents=True, exist_ok=True)
-        for path in sorted(src.rglob('*'), key=lambda p: str(p)):
-            if path.is_symlink():
-                continue
-            rel = path.relative_to(src)
-            target = dst / rel
-            if path.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-            elif path.is_file():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
-
     def _stage_input(self, job: Job) -> Path:
+        target = Path(job.request['target_path'])
         staged_root = Path(job.workdir) / 'input'
         ensure_dir(staged_root)
-
-        if job.request.get('input_mode') == 'upload':
-            upload_path = Path(job.request['uploaded_path'])
-            if not upload_path.is_file():
-                raise ValueError(f'uploaded file does not exist: {upload_path}')
-            repo_name = self._safe_vulture_repo_name(job, upload_path)
-            dest_dir = staged_root / repo_name
-            kind = job.request.get('input_kind', 'archive')
-            if kind == 'file':
-                if dest_dir.exists():
-                    shutil.rmtree(dest_dir)
-                ensure_dir(dest_dir)
-                shutil.copy2(upload_path, dest_dir / upload_path.name)
-                self._log(f'staged uploaded file source={upload_path} dest={dest_dir} repo_name={repo_name}')
-            elif kind == 'archive':
-                archive_kind = self._safe_extract_upload_archive(upload_path, dest_dir)
-                self._log(
-                    f'staged uploaded archive source={upload_path} dest={dest_dir} '
-                    f'repo_name={repo_name} archive_kind={archive_kind}'
-                )
-            else:
-                raise ValueError('input_kind must be archive or file for upload scans')
-            return dest_dir
-
-        target = Path(job.request['target_path'])
-        repo_name = self._safe_vulture_repo_name(job, target)
-        dest_dir = staged_root / repo_name
         if job.request.get('input_kind') == 'file':
-            if dest_dir.exists():
-                shutil.rmtree(dest_dir)
+            dest_dir = staged_root / (job.request.get('job_name') or target.stem or 'input')
             ensure_dir(dest_dir)
             shutil.copy2(target, dest_dir / target.name)
-        else:
-            self._copy_tree(target, dest_dir)
-        self._log(f'staged input source={target} dest={dest_dir} repo_name={repo_name}')
-        return dest_dir
+            return dest_dir
+        return target
 
     def _run_job(self, job: Job) -> None:
         req = job.request
@@ -620,56 +478,28 @@ class VultureService:
                     tpl_results['parsed_lines'] = []
 
                 func_result = VULTURE_REPO / 'TPLReuseDetector' / 'res' / f'result_{project_name}_func'
-                modified_name = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
                 if func_result.exists():
-                    func_text = func_result.read_text(encoding='utf-8', errors='replace').strip()
+                    proc2 = subprocess.Popen(
+                        [VULTURE_PYTHON, 'fp_eliminator.py', str(func_result)],
+                        cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
+                        stdout=out,
+                        stderr=err,
+                        env=env,
+                        preexec_fn=os.setsid,
+                    )
+                    with self._lock:
+                        self._procs[job.job_id] = proc2
+                        job.pid = proc2.pid
                     try:
-                        func_json = json.loads(func_text) if func_text else {}
-                    except json.JSONDecodeError as exc:
-                        raise RuntimeError(f'invalid TPL function result JSON: {func_result}: {exc}') from exc
-
-                    if not isinstance(func_json, dict):
-                        raise RuntimeError(f'invalid TPL function result shape: {func_result}')
-
-                    if not func_json:
-                        modified_name.write_text('', encoding='utf-8')
+                        proc2.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(os.getpgid(proc2.pid), signal.SIGTERM)
+                        raise RuntimeError('TPL false-positive elimination timed out')
+                    modified_name = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
+                    if modified_name.exists():
                         shutil.copy2(modified_name, raw_fp)
-                        tpl_results['fp_eliminated_lines'] = []
-                    elif project_name not in func_json:
-                        keys = sorted(str(k) for k in func_json.keys())[:20]
-                        raise RuntimeError(
-                            f'TPL function result repo mismatch: expected {project_name}, got keys={keys}'
-                        )
-                    else:
-                        proc2 = subprocess.Popen(
-                            [VULTURE_PYTHON, 'fp_eliminator.py', str(func_result)],
-                            cwd=str(VULTURE_REPO / 'TPLReuseDetector'),
-                            stdout=out,
-                            stderr=err,
-                            env=env,
-                            preexec_fn=os.setsid,
-                        )
-                        with self._lock:
-                            self._procs[job.job_id] = proc2
-                            job.pid = proc2.pid
-                        try:
-                            proc2.wait(timeout=timeout)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(os.getpgid(proc2.pid), signal.SIGTERM)
-                            raise RuntimeError('TPL false-positive elimination timed out')
-                        if proc2.returncode != 0:
-                            raise RuntimeError(f'TPL false-positive elimination failed with exit code {proc2.returncode}')
-                        if modified_name.exists():
-                            shutil.copy2(modified_name, raw_fp)
-                            tpl_results['fp_eliminated_lines'] = modified_name.read_text(
-                                encoding='utf-8',
-                                errors='replace',
-                            ).splitlines()
-                        else:
-                            raise RuntimeError(f'TPL false-positive elimination did not create expected output: {modified_name}')
+                        tpl_results['fp_eliminated_lines'] = modified_name.read_text(encoding='utf-8', errors='replace').splitlines()
                 else:
-                    modified_name.write_text('', encoding='utf-8')
-                    shutil.copy2(modified_name, raw_fp)
                     tpl_results['fp_eliminated_lines'] = []
 
             if run_oneday:
@@ -703,10 +533,7 @@ class VultureService:
             'job_id': job.job_id,
             'status': 'done',
             'service': 'vulture',
-            'input_mode': job.request.get('input_mode', 'path'),
-            'target_path': job.request.get('target_path'),
-            'uploaded_filename': job.request.get('upload_filename'),
-            'uploaded_size': job.request.get('uploaded_size'),
+            'target_path': job.request['target_path'],
             'input_kind': job.request.get('input_kind', 'directory'),
             'dataset_auto_extracted': auto_extract,
             'tpl_reuse': tpl_results,
