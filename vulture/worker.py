@@ -434,6 +434,75 @@ class VultureService:
             return 'tar'
         raise ValueError(f'unsupported upload archive type: {archive_path.name}')
 
+    def _oneday_canonical_key_candidates(self, component: str) -> List[str]:
+        aligned_patch = VULTURE_REPO / 'OneDayDetector' / 'aligned_patch'
+        aligned_cpe = VULTURE_REPO / 'OneDayDetector' / 'aligned_cpe'
+        if not aligned_patch.is_dir():
+            raise RuntimeError(f'OneDayDetector aligned_patch directory is missing: {aligned_patch}')
+        if not aligned_cpe.is_dir():
+            raise RuntimeError(f'OneDayDetector aligned_cpe directory is missing: {aligned_cpe}')
+
+        patch_keys = {
+            path.name
+            for path in aligned_patch.iterdir()
+            if path.is_dir() and '_' in path.name
+        }
+        cpe_keys = {
+            path.name[:-5]
+            for path in aligned_cpe.iterdir()
+            if path.is_file() and path.name.endswith('.json') and '_' in path.name[:-5]
+        }
+        keys = sorted(patch_keys & cpe_keys)
+        candidates: List[str] = []
+        for key in keys:
+            owner, repo = key.split('_', 1)
+            if owner and repo == component:
+                candidates.append(key)
+        return candidates
+
+    def _canonicalize_oneday_component(self, component: str) -> str:
+        if '@@' in component:
+            owner, repo = component.split('@@', 1)
+            if not owner or not repo:
+                raise RuntimeError(f'invalid OneDayDetector component key: {component}')
+            return component
+
+        candidates = self._oneday_canonical_key_candidates(component)
+        if len(candidates) != 1:
+            raise RuntimeError(
+                'cannot canonicalize OneDayDetector component key '
+                f'{component!r}: expected exactly one aligned_patch/aligned_cpe match, got {candidates}'
+            )
+        owner, repo = candidates[0].split('_', 1)
+        return f'{owner}@@{repo}'
+
+    def _normalize_oneday_reuse_info_file(self, path: Path) -> List[str]:
+        if not path.exists():
+            raise RuntimeError(f'OneDayDetector reuse-info file does not exist: {path}')
+
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        normalized: List[str] = []
+        changed = False
+        for line_no, line in enumerate(lines, start=1):
+            if not line.strip() or line.startswith('\t'):
+                normalized.append(line)
+                continue
+
+            match = re.match(r'^(\S+)\s+(\S+)\s*:\s*$', line)
+            if match is None:
+                raise RuntimeError(f'invalid OneDayDetector reuse-info line: {path}:{line_no}: {line}')
+
+            component = match.group(1)
+            version = match.group(2)
+            canonical_component = self._canonicalize_oneday_component(component)
+            if canonical_component != component:
+                changed = True
+            normalized.append(f'{canonical_component} {version} :')
+
+        if changed:
+            path.write_text('\n'.join(normalized) + ('\n' if normalized else ''), encoding='utf-8')
+        return normalized
+
     def _copy_tree(self, src: Path, dst: Path) -> None:
         if dst.exists():
             shutil.rmtree(dst)
@@ -582,11 +651,8 @@ class VultureService:
                         if proc2.returncode != 0:
                             raise RuntimeError(f'TPL false-positive elimination failed with exit code {proc2.returncode}')
                         if modified_name.exists():
+                            tpl_results['fp_eliminated_lines'] = self._normalize_oneday_reuse_info_file(modified_name)
                             shutil.copy2(modified_name, raw_fp)
-                            tpl_results['fp_eliminated_lines'] = modified_name.read_text(
-                                encoding='utf-8',
-                                errors='replace',
-                            ).splitlines()
                         else:
                             raise RuntimeError(f'TPL false-positive elimination did not create expected output: {modified_name}')
                 else:
@@ -595,6 +661,11 @@ class VultureService:
                     tpl_results['fp_eliminated_lines'] = []
 
             if run_oneday:
+                if req.get('run_tpl_reuse', True):
+                    oneday_reuse_file = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
+                    if oneday_reuse_file.exists():
+                        tpl_results['fp_eliminated_lines'] = self._normalize_oneday_reuse_info_file(oneday_reuse_file)
+                        shutil.copy2(oneday_reuse_file, raw_fp)
                 proc3 = subprocess.Popen(
                     [VULTURE_PYTHON, 'VersionBasedDetection.py', str(staged)],
                     cwd=str(VULTURE_REPO / 'OneDayDetector'),
