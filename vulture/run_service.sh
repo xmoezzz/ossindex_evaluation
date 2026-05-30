@@ -7,6 +7,7 @@ PORT="${PORT:-8808}"
 PYTHON="${PYTHON:-python3.11}"
 
 cd "$SCRIPT_DIR"
+export VULTURE_PYTHON="$PYTHON"
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
   echo "ERROR: python interpreter not found: $PYTHON" >&2

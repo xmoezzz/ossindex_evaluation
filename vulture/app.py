@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from worker import ServiceUnavailableError, VultureService
 
-app = FastAPI(title='vulture_service', version='1.0.0')
+app = FastAPI(title='vulture_service', version='1.1.0')
 svc = VultureService()
 
 
@@ -57,6 +57,58 @@ def submit(req: ScanRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+async def submit_upload(
+    *,
+    file: UploadFile,
+    job_name: Optional[str],
+    input_kind: Literal['archive', 'file'],
+    run_tpl_reuse: bool,
+    run_oneday_detection: bool,
+    timeout_seconds: int,
+    keep_workdir: bool,
+):
+    if timeout_seconds < 60 or timeout_seconds > 172800:
+        raise HTTPException(status_code=422, detail='timeout_seconds must be between 60 and 172800')
+
+    request = {
+        'job_name': job_name,
+        'input_kind': input_kind,
+        'run_tpl_reuse': run_tpl_reuse,
+        'run_oneday_detection': run_oneday_detection,
+        'timeout_seconds': timeout_seconds,
+        'keep_workdir': keep_workdir,
+    }
+
+    try:
+        reservation = svc.reserve_upload_scan(request, file.filename or 'upload.bin')
+        size = 0
+        with open(reservation['upload_path'], 'wb') as fp:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                fp.write(chunk)
+                size += len(chunk)
+        return svc.finish_upload_scan(reservation['job_id'], size)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f'missing required field: {exc.args[0]}')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ServiceUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        job_id = None
+        if 'reservation' in locals() and isinstance(reservation, dict):
+            job_id = reservation.get('job_id')
+        if isinstance(job_id, str):
+            svc.fail_upload_scan(job_id, str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        await file.close()
+
+
 @app.post('/scan')
 def scan(req: ScanRequest):
     return submit(req)
@@ -65,6 +117,48 @@ def scan(req: ScanRequest):
 @app.post('/api/v1/analyze')
 def api_analyze(req: ScanRequest):
     return submit(req)
+
+
+@app.post('/scan/upload')
+async def scan_upload(
+    file: UploadFile = File(...),
+    job_name: Optional[str] = Form(default=None),
+    input_kind: Literal['archive', 'file'] = Form(default='archive'),
+    run_tpl_reuse: bool = Form(default=True),
+    run_oneday_detection: bool = Form(default=True),
+    timeout_seconds: int = Form(default=21600),
+    keep_workdir: bool = Form(default=False),
+):
+    return await submit_upload(
+        file=file,
+        job_name=job_name,
+        input_kind=input_kind,
+        run_tpl_reuse=run_tpl_reuse,
+        run_oneday_detection=run_oneday_detection,
+        timeout_seconds=timeout_seconds,
+        keep_workdir=keep_workdir,
+    )
+
+
+@app.post('/api/v1/analyze/upload')
+async def api_analyze_upload(
+    file: UploadFile = File(...),
+    job_name: Optional[str] = Form(default=None),
+    input_kind: Literal['archive', 'file'] = Form(default='archive'),
+    run_tpl_reuse: bool = Form(default=True),
+    run_oneday_detection: bool = Form(default=True),
+    timeout_seconds: int = Form(default=21600),
+    keep_workdir: bool = Form(default=False),
+):
+    return await scan_upload(
+        file=file,
+        job_name=job_name,
+        input_kind=input_kind,
+        run_tpl_reuse=run_tpl_reuse,
+        run_oneday_detection=run_oneday_detection,
+        timeout_seconds=timeout_seconds,
+        keep_workdir=keep_workdir,
+    )
 
 
 @app.get('/jobs')
