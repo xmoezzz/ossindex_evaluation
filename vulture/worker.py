@@ -460,32 +460,72 @@ class VultureService:
                 candidates.append(key)
         return candidates
 
-    def _canonicalize_oneday_component(self, component: str) -> str:
+    def _empty_oneday_summary(self) -> Dict[str, List[str]]:
+        return {
+            'vulnerable_cves_exact': [],
+            'vulnerable_cves_modified': [],
+            'patched_cves_exact': [],
+            'patched_cves_modified': [],
+            'version_detection': [],
+        }
+
+    def _oneday_runtime_key_exists(self, key: str) -> bool:
+        aligned_patch = VULTURE_REPO / 'OneDayDetector' / 'aligned_patch'
+        aligned_cpe = VULTURE_REPO / 'OneDayDetector' / 'aligned_cpe'
+        return (aligned_patch / key).is_dir() and (aligned_cpe / f'{key}.json').is_file()
+
+    def _canonicalize_oneday_component(self, component: str) -> Tuple[Optional[str], str]:
         if '@@' in component:
             owner, repo = component.split('@@', 1)
             if not owner or not repo:
                 raise RuntimeError(f'invalid OneDayDetector component key: {component}')
-            return component
+            key = f'{owner}_{repo}'
+            if self._oneday_runtime_key_exists(key):
+                return component, 'already_canonical'
+            return None, f'missing official OneDayDetector data for canonical key {key}'
 
         candidates = self._oneday_canonical_key_candidates(component)
-        if len(candidates) != 1:
-            raise RuntimeError(
-                'cannot canonicalize OneDayDetector component key '
-                f'{component!r}: expected exactly one aligned_patch/aligned_cpe match, got {candidates}'
-            )
-        owner, repo = candidates[0].split('_', 1)
-        return f'{owner}@@{repo}'
+        if len(candidates) == 1:
+            owner, repo = candidates[0].split('_', 1)
+            return f'{owner}@@{repo}', f'canonicalized from {component} using {candidates[0]}'
+        if len(candidates) == 0:
+            return None, f'no official OneDayDetector aligned_patch/aligned_cpe match for {component}'
+        return None, f'ambiguous official OneDayDetector matches for {component}: {candidates}'
 
-    def _normalize_oneday_reuse_info_file(self, path: Path) -> List[str]:
+    def _prepare_oneday_reuse_info_file(self, path: Path) -> Dict[str, Any]:
         if not path.exists():
             raise RuntimeError(f'OneDayDetector reuse-info file does not exist: {path}')
 
         lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
         normalized: List[str] = []
+        skipped: List[Dict[str, Any]] = []
         changed = False
-        for line_no, line in enumerate(lines, start=1):
-            if not line.strip() or line.startswith('\t'):
-                normalized.append(line)
+        kept_components = 0
+        idx = 0
+
+        while idx < len(lines):
+            line_no = idx + 1
+            line = lines[idx]
+
+            if not line.strip():
+                if normalized:
+                    normalized.append(line)
+                idx += 1
+                continue
+
+            if line.startswith('\t'):
+                if normalized:
+                    normalized.append(line)
+                else:
+                    skipped.append({
+                        'line': line_no,
+                        'component': None,
+                        'version': None,
+                        'reason': 'path line appeared before any supported component header',
+                        'raw_line': line,
+                    })
+                    changed = True
+                idx += 1
                 continue
 
             match = re.match(r'^(\S+)\s+(\S+)\s*:\s*$', line)
@@ -494,14 +534,44 @@ class VultureService:
 
             component = match.group(1)
             version = match.group(2)
-            canonical_component = self._canonicalize_oneday_component(component)
+            group_lines: List[str] = []
+            idx += 1
+            while idx < len(lines):
+                next_line = lines[idx]
+                if next_line.startswith('\t') or not next_line.strip():
+                    group_lines.append(next_line)
+                    idx += 1
+                    continue
+                break
+
+            canonical_component, reason = self._canonicalize_oneday_component(component)
+            if canonical_component is None:
+                skipped.append({
+                    'line': line_no,
+                    'component': component,
+                    'version': version,
+                    'reason': reason,
+                    'raw_line': line,
+                    'path_count': sum(1 for item in group_lines if item.startswith('\t')),
+                })
+                changed = True
+                continue
+
             if canonical_component != component:
                 changed = True
+            kept_components += 1
             normalized.append(f'{canonical_component} {version} :')
+            normalized.extend(group_lines)
 
         if changed:
             path.write_text('\n'.join(normalized) + ('\n' if normalized else ''), encoding='utf-8')
-        return normalized
+
+        return {
+            'lines': normalized,
+            'kept_components': kept_components,
+            'skipped_components': skipped,
+            'changed': changed,
+        }
 
     def _copy_tree(self, src: Path, dst: Path) -> None:
         if dst.exists():
@@ -651,8 +721,9 @@ class VultureService:
                         if proc2.returncode != 0:
                             raise RuntimeError(f'TPL false-positive elimination failed with exit code {proc2.returncode}')
                         if modified_name.exists():
-                            tpl_results['fp_eliminated_lines'] = self._normalize_oneday_reuse_info_file(modified_name)
+                            original_fp_lines = modified_name.read_text(encoding='utf-8', errors='replace').splitlines()
                             shutil.copy2(modified_name, raw_fp)
+                            tpl_results['fp_eliminated_lines'] = original_fp_lines
                         else:
                             raise RuntimeError(f'TPL false-positive elimination did not create expected output: {modified_name}')
                 else:
@@ -661,34 +732,55 @@ class VultureService:
                     tpl_results['fp_eliminated_lines'] = []
 
             if run_oneday:
+                should_run_oneday = True
                 if req.get('run_tpl_reuse', True):
                     oneday_reuse_file = VULTURE_REPO / 'TPLReuseDetector' / f'modified_result_without_func{project_name}'
                     if oneday_reuse_file.exists():
-                        tpl_results['fp_eliminated_lines'] = self._normalize_oneday_reuse_info_file(oneday_reuse_file)
-                        shutil.copy2(oneday_reuse_file, raw_fp)
-                proc3 = subprocess.Popen(
-                    [VULTURE_PYTHON, 'VersionBasedDetection.py', str(staged)],
-                    cwd=str(VULTURE_REPO / 'OneDayDetector'),
-                    stdout=subprocess.PIPE,
-                    stderr=err,
-                    env=env,
-                    text=True,
-                    preexec_fn=os.setsid,
-                )
-                with self._lock:
-                    self._procs[job.job_id] = proc3
-                    job.pid = proc3.pid
-                try:
-                    stdout_data, _ = proc3.communicate(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(proc3.pid), signal.SIGTERM)
-                    raise RuntimeError('1-day detection timed out')
-                raw_oneday.write_text(stdout_data, encoding='utf-8')
-                out.write(stdout_data)
-                if proc3.returncode != 0:
-                    raise RuntimeError(f'1-day detection failed with exit code {proc3.returncode}')
-                oneday_results['summary'] = self._parse_oneday_stdout(stdout_data)
-                oneday_results['stdout'] = stdout_data.splitlines()
+                        prepared_oneday = self._prepare_oneday_reuse_info_file(oneday_reuse_file)
+                        oneday_results['reuse_info_lines'] = prepared_oneday['lines']
+                        oneday_results['reuse_info_kept_components'] = prepared_oneday['kept_components']
+                        oneday_results['reuse_info_skipped_components'] = prepared_oneday['skipped_components']
+                        oneday_results['reuse_info_changed'] = prepared_oneday['changed']
+                        if prepared_oneday['kept_components'] == 0:
+                            should_run_oneday = False
+                            oneday_results['skipped'] = True
+                            oneday_results['skip_reason'] = 'no supported OneDayDetector component remained after canonicalization'
+                            oneday_results['summary'] = self._empty_oneday_summary()
+                            oneday_results['stdout'] = []
+                            raw_oneday.write_text('', encoding='utf-8')
+                    else:
+                        should_run_oneday = False
+                        oneday_results['skipped'] = True
+                        oneday_results['skip_reason'] = f'OneDayDetector reuse-info file not found: {oneday_reuse_file}'
+                        oneday_results['summary'] = self._empty_oneday_summary()
+                        oneday_results['stdout'] = []
+                        raw_oneday.write_text('', encoding='utf-8')
+
+                if should_run_oneday:
+                    proc3 = subprocess.Popen(
+                        [VULTURE_PYTHON, 'VersionBasedDetection.py', str(staged)],
+                        cwd=str(VULTURE_REPO / 'OneDayDetector'),
+                        stdout=subprocess.PIPE,
+                        stderr=err,
+                        env=env,
+                        text=True,
+                        preexec_fn=os.setsid,
+                    )
+                    with self._lock:
+                        self._procs[job.job_id] = proc3
+                        job.pid = proc3.pid
+                    try:
+                        stdout_data, _ = proc3.communicate(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(os.getpgid(proc3.pid), signal.SIGTERM)
+                        raise RuntimeError('1-day detection timed out')
+                    raw_oneday.write_text(stdout_data, encoding='utf-8')
+                    out.write(stdout_data)
+                    if proc3.returncode != 0:
+                        raise RuntimeError(f'1-day detection failed with exit code {proc3.returncode}')
+                    oneday_results['summary'] = self._parse_oneday_stdout(stdout_data)
+                    oneday_results['stdout'] = stdout_data.splitlines()
+                    oneday_results['skipped'] = False
 
         with self._lock:
             self._procs.pop(job.job_id, None)
