@@ -11,6 +11,7 @@ SERVER_APP="${CEBIN_ROOT}/client_server/server/app.py"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-9088}"
 DEVICE="${DEVICE:-mps}"
+DTYPE="${DTYPE:-float16}"
 
 if [[ ! -f "${SERVER_APP}" ]]; then
   echo "[ERROR] server app not found: ${SERVER_APP}" >&2
@@ -31,6 +32,7 @@ echo "[INFO] CEBIN_ROOT=${CEBIN_ROOT}"
 echo "[INFO] EMBEDDING_MODEL=${EMBEDDING_MODEL}"
 echo "[INFO] COMPARISON_MODEL=${COMPARISON_MODEL}"
 echo "[INFO] DEVICE=${DEVICE}"
+echo "[INFO] DTYPE=${DTYPE}"
 echo "[INFO] HOST=${HOST}"
 echo "[INFO] PORT=${PORT}"
 
@@ -39,5 +41,6 @@ exec python3.11 "${SERVER_APP}" \
   --embedding-model "${EMBEDDING_MODEL}" \
   --comparison-model "${COMPARISON_MODEL}" \
   --device "${DEVICE}" \
+  --dtype "${DTYPE}" \
   --host "${HOST}" \
   --port "${PORT}"
